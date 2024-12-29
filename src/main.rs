@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Vec2};
 use std::path::{Path, PathBuf};
 
