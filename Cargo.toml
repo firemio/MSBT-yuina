@@ -1,0 +1,11 @@
+[package]
+name = "simple-image-viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.24.1"
+egui = "0.24.1"
+image = { version = "0.24.7", features = ["webp"] }
+rfd = "0.12.1"
+winapi = { version = "0.3.9", features = ["winuser", "windef"] }
