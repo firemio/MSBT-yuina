@@ -2,6 +2,10 @@
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Vec2};
 use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+use log::{error, info};
+use std::fs::File;
+use std::io::Read;
 
 struct ImageViewer {
     current_image: Option<egui::TextureHandle>,
@@ -19,6 +23,7 @@ struct ImageViewer {
     current_image_index: Option<usize>,
     available_size: Option<Vec2>,
     initial_path: Option<PathBuf>,
+    dropped_files: Vec<PathBuf>,
 }
 
 impl Default for ImageViewer {
@@ -39,6 +44,7 @@ impl Default for ImageViewer {
             current_image_index: None,
             available_size: None,
             initial_path: std::env::args().nth(1).map(PathBuf::from),
+            dropped_files: Vec::new(),
         }
     }
 }
@@ -46,25 +52,40 @@ impl Default for ImageViewer {
 impl ImageViewer {
     fn update_image_list(&mut self, current_path: &Path) {
         if let Some(parent) = current_path.parent() {
-            let mut files: Vec<_> = std::fs::read_dir(parent)
-                .unwrap()
-                .filter_map(|entry| {
-                    let entry = entry.ok()?;
-                    let path = entry.path();
-                    if path.extension().map_or(false, |ext| {
-                        let ext = ext.to_string_lossy().to_lowercase();
-                        ["jpg", "jpeg", "png", "gif", "webp", "bmp"].contains(&ext.as_str())
-                    }) {
-                        Some(path)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            
-            files.sort();
-            self.image_list = files;
-            self.current_image_index = self.image_list.iter().position(|p| p == current_path);
+            info!("ディレクトリを読み込もうとしています: {:?}", parent);
+            match std::fs::read_dir(parent) {
+                Ok(entries) => {
+                    let mut files: Vec<_> = entries
+                        .filter_map(|entry| {
+                            match entry {
+                                Ok(entry) => {
+                                    let path = entry.path();
+                                    if path.extension().map_or(false, |ext| {
+                                        let ext = ext.to_string_lossy().to_lowercase();
+                                        ["jpg", "jpeg", "png", "gif", "webp", "bmp"].contains(&ext.as_str())
+                                    }) {
+                                        Some(path)
+                                    } else {
+                                        None
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("ディレクトリエントリの読み込みに失敗: {}", e);
+                                    None
+                                }
+                            }
+                        })
+                        .collect();
+                    
+                    files.sort();
+                    self.image_list = files;
+                    self.current_image_index = self.image_list.iter().position(|p| p == current_path);
+                    info!("ディレクトリの読み込みに成功しました: {:?}", parent);
+                }
+                Err(e) => {
+                    error!("ディレクトリの読み込みに失敗しました: {:?} - エラー: {}", parent, e);
+                }
+            }
         }
     }
 
@@ -80,23 +101,47 @@ impl ImageViewer {
     }
 
     fn load_image(&mut self, path: &Path, ctx: &egui::Context) {
-        if let Ok(img) = image::open(path) {
-            let size = [img.width(), img.height()];
-            let image_buffer = img.to_rgba8();
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [size[0] as _, size[1] as _],
-                &image_buffer,
-            );
-            self.current_image = Some(ctx.load_texture(
-                "current-image",
-                image,
-                egui::TextureOptions::default(),
-            ));
-            self.current_path = Some(path.to_path_buf());
-            self.image_size = Some(size);
-            self.update_image_list(path);
-            self.update_scale(ctx);
-            self.update_window_title(ctx);
+        info!("画像を読み込もうとしています: {:?}", path);
+        
+        // まずファイルをバッファに読み込む
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(e) => {
+                error!("ファイルを開けませんでした: {:?} - エラー: {}", path, e);
+                return;
+            }
+        };
+
+        let mut buffer = Vec::new();
+        if let Err(e) = file.read_to_end(&mut buffer) {
+            error!("ファイルの読み込みに失敗しました: {:?} - エラー: {}", path, e);
+            return;
+        }
+
+        // メモリ上のバッファから画像を読み込む
+        match image::load_from_memory(&buffer) {
+            Ok(img) => {
+                let size = [img.width(), img.height()];
+                let image_buffer = img.to_rgba8();
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [size[0] as _, size[1] as _],
+                    &image_buffer,
+                );
+                self.current_image = Some(ctx.load_texture(
+                    "current-image",
+                    image,
+                    egui::TextureOptions::default(),
+                ));
+                self.current_path = Some(path.to_path_buf());
+                self.image_size = Some(size);
+                self.update_image_list(path);
+                self.update_scale(ctx);
+                self.update_window_title(ctx);
+                info!("画像の読み込みに成功しました: {:?}", path);
+            }
+            Err(e) => {
+                error!("画像のデコードに失敗しました: {:?} - エラー: {}", path, e);
+            }
         }
     }
 
@@ -179,6 +224,31 @@ impl eframe::App for ImageViewer {
                 self.load_image(&path, ctx);
             }
         }
+
+        // ドラッグ&ドロップの処理を追加
+        if !self.dropped_files.is_empty() {
+            if let Some(path) = self.dropped_files.pop() {
+                info!("ドロップされたファイルを処理: {:?}", path);
+                self.load_image(&path, ctx);
+            }
+        }
+
+        // ドロップ領域の設定
+        ctx.input(|i| {
+            if !i.raw.dropped_files.is_empty() {
+                self.dropped_files = i
+                    .raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|file| {
+                        file.path.clone().map(|path| {
+                            info!("ファイルがドロップされました: {:?}", path);
+                            path
+                        })
+                    })
+                    .collect();
+            }
+        });
 
         if self.should_load_prev {
             self.should_load_prev = false;
@@ -301,15 +371,18 @@ impl eframe::App for ImageViewer {
 }
 
 fn main() -> eframe::Result<()> {
+    env_logger::init();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
+            .with_drag_and_drop(true)
             .with_title("Simple Image Viewer"),
         ..Default::default()
     };
+
     eframe::run_native(
         "Simple Image Viewer",
         options,
-        Box::new(|_cc| Box::new(ImageViewer::default())),
+        Box::new(|_cc| Box::<ImageViewer>::default()),
     )
 }
