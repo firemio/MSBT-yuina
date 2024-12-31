@@ -1,11 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use eframe::egui::{self, Color32, Pos2, Rect, Sense, Vec2};
+use eframe::egui::{self, Color32, Pos2, Rect, Sense, Vec2, IconData};
 use std::path::{Path, PathBuf};
-use std::ffi::OsStr;
 use log::{error, info};
-use std::fs::File;
-use std::io::Read;
+use std::fs;
+use std::io::Cursor;
+use std::sync::Arc;
+use image::io::Reader as ImageReader;
 
 struct ImageViewer {
     current_image: Option<egui::TextureHandle>,
@@ -53,7 +54,7 @@ impl ImageViewer {
     fn update_image_list(&mut self, current_path: &Path) {
         if let Some(parent) = current_path.parent() {
             info!("ディレクトリを読み込もうとしています: {:?}", parent);
-            match std::fs::read_dir(parent) {
+            match fs::read_dir(parent) {
                 Ok(entries) => {
                     let mut files: Vec<_> = entries
                         .filter_map(|entry| {
@@ -103,44 +104,49 @@ impl ImageViewer {
     fn load_image(&mut self, path: &Path, ctx: &egui::Context) {
         info!("画像を読み込もうとしています: {:?}", path);
         
-        // まずファイルをバッファに読み込む
-        let mut file = match File::open(path) {
-            Ok(file) => file,
-            Err(e) => {
-                error!("ファイルを開けませんでした: {:?} - エラー: {}", path, e);
-                return;
+        match fs::read(path) {
+            Ok(buffer) => {
+                info!("ファイルを読み込みました: {} bytes", buffer.len());
+                
+                // メモリ上のバッファから画像を読み込む
+                match ImageReader::new(Cursor::new(buffer))
+                    .with_guessed_format()
+                    .map_err(|e| error!("フォーマットの推測に失敗: {}", e))
+                    .and_then(|reader| reader.decode().map_err(|e| error!("デコードに失敗: {}", e)))
+                {
+                    Ok(img) => {
+                        let size = [img.width(), img.height()];
+                        let image_buffer = img.to_rgba8();
+                        
+                        // テクスチャを作成
+                        let texture = ctx.load_texture(
+                            "current_image",
+                            egui::ColorImage::from_rgba_unmultiplied(
+                                [size[0] as _, size[1] as _],
+                                &image_buffer,
+                            ),
+                            Default::default(),
+                        );
+                        
+                        self.current_image = Some(texture);
+                        self.current_path = Some(path.to_path_buf());
+                        self.image_size = Some(size);
+                        self.update_image_list(path);
+                        info!("画像の読み込みに成功: {}x{}", size[0], size[1]);
+                    }
+                    Err(_) => {
+                        error!("画像のデコードに失敗しました");
+                        self.current_image = None;
+                        self.current_path = None;
+                        self.image_size = None;
+                    }
+                }
             }
-        };
-
-        let mut buffer = Vec::new();
-        if let Err(e) = file.read_to_end(&mut buffer) {
-            error!("ファイルの読み込みに失敗しました: {:?} - エラー: {}", path, e);
-            return;
-        }
-
-        // メモリ上のバッファから画像を読み込む
-        match image::load_from_memory(&buffer) {
-            Ok(img) => {
-                let size = [img.width(), img.height()];
-                let image_buffer = img.to_rgba8();
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [size[0] as _, size[1] as _],
-                    &image_buffer,
-                );
-                self.current_image = Some(ctx.load_texture(
-                    "current-image",
-                    image,
-                    egui::TextureOptions::default(),
-                ));
-                self.current_path = Some(path.to_path_buf());
-                self.image_size = Some(size);
-                self.update_image_list(path);
-                self.update_scale(ctx);
-                self.update_window_title(ctx);
-                info!("画像の読み込みに成功しました: {:?}", path);
-            }
             Err(e) => {
-                error!("画像のデコードに失敗しました: {:?} - エラー: {}", path, e);
+                error!("ファイルの読み込みに失敗しました: {}", e);
+                self.current_image = None;
+                self.current_path = None;
+                self.image_size = None;
             }
         }
     }
@@ -370,13 +376,26 @@ impl eframe::App for ImageViewer {
     }
 }
 
+fn load_icon() -> Arc<IconData> {
+    let icon_data = include_bytes!("app.ico");
+    let width = 32;
+    let height = 32;
+    
+    Arc::new(IconData {
+        rgba: icon_data.to_vec(),
+        width,
+        height,
+    })
+}
+
 fn main() -> eframe::Result<()> {
     env_logger::init();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
             .with_drag_and_drop(true)
-            .with_title("Simple Image Viewer"),
+            .with_title("Simple Image Viewer")
+            .with_icon(load_icon()),
         ..Default::default()
     };
 

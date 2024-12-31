@@ -1,0 +1,32 @@
+#define RT_MANIFEST 24
+1 24 "app.manifest"
+1 ICON "app.ico"
+
+1 VERSIONINFO
+FILEVERSION     0,1,0,0
+PRODUCTVERSION  0,1,0,0
+FILEFLAGSMASK   0x3fL
+FILEFLAGS       0x0L
+FILEOS          0x40004L
+FILETYPE        0x1L
+FILESUBTYPE     0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "041103A4"
+        BEGIN
+            VALUE "CompanyName", "MSBT"
+            VALUE "FileDescription", "Simple Image Viewer"
+            VALUE "FileVersion", "0.1.0.0"
+            VALUE "InternalName", "MSBT-yuina"
+            VALUE "LegalCopyright", "Copyright 2024 MSBT"
+            VALUE "OriginalFilename", "MSBT-yuina.exe"
+            VALUE "ProductName", "MSBT-yuina"
+            VALUE "ProductVersion", "0.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x411, 932
+    END
+END

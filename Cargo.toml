@@ -2,12 +2,25 @@
 name = "MSBT-yuina"
 version = "0.1.0"
 edition = "2021"
+authors = ["MSBT"]
+description = "Simple Image Viewer"
+
+[build-dependencies]
+embed-resource = "2.2"
+
+[profile.release]
+opt-level = 'z'     # 最小サイズ最適化
+lto = true          # Link Time Optimization を有効化
+codegen-units = 1   # 単一ユニットでコンパイル
+panic = 'abort'     # パニック時のスタックトレース機能を無効化
+strip = true        # デバッグシンボルを削除
 
 [dependencies]
-eframe = "0.24.1"
-egui = "0.24.1"
-image = { version = "0.24.7", features = ["webp"] }
-rfd = "0.12.1"
+eframe = { version = "0.24.1", default-features = false, features = ["default_fonts", "glow"] }
+egui = { version = "0.24.1", default-features = false }
+image = { version = "0.24.7", default-features = false, features = ["webp", "jpeg", "png"] }
+rfd = { version = "0.12.1", default-features = false }
 winapi = { version = "0.3.9", features = ["winuser", "windef"] }
-log = "0.4"
-env_logger = "0.10"
+log = { version = "0.4", features = ["release_max_level_info"] }
+env_logger = { version = "0.10", default-features = false }
+ico = { version = "0.3.0", default-features = false }
