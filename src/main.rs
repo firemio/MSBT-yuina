@@ -14,6 +14,25 @@ use log4rs::{
 };
 use std::panic;
 use ico;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct ViewerConfig {
+    initial_display_mode: String,
+}
+
+impl ViewerConfig {
+    fn load() -> Result<Self, Box<dyn std::error::Error>> {
+        let exe_path = std::env::current_exe()?;
+        let exe_name = exe_path
+            .file_stem()
+            .ok_or("Failed to get executable name")?
+            .to_string_lossy();
+        let config_str = fs::read_to_string(format!("{}.toml", exe_name))?;
+        let config: ViewerConfig = toml::from_str(&config_str)?;
+        Ok(config)
+    }
+}
 
 fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
     // 実行ファイルのパスを取得
@@ -71,7 +90,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             info!("アプリケーションコンテキストの作成開始");
-            Box::new(ImageViewer::default())
+            Box::new(ImageViewer::new(cc))
         }),
     ) {
         Ok(_) => {
@@ -127,11 +146,30 @@ struct ImageViewer {
     should_load_next: bool,
     should_load_prev: bool,
     open_file_dialog: bool,
+    pan_offset: Vec2,
 }
 
 struct LoadedImage {
     texture: egui::TextureHandle,
     path: PathBuf,
+}
+
+impl ImageViewer {
+    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let mut viewer = Self::default();
+        
+        // Load configuration
+        if let Ok(config) = ViewerConfig::load() {
+            match config.initial_display_mode.as_str() {
+                "original" => {
+                    viewer.scale = 1.0;
+                },
+                _ => {} // Default is "fit" mode
+            }
+        }
+        
+        viewer
+    }
 }
 
 impl Default for ImageViewer {
@@ -162,6 +200,7 @@ impl Default for ImageViewer {
             should_load_next: false,
             should_load_prev: false,
             open_file_dialog: false,
+            pan_offset: Vec2::ZERO,
         };
         info!("ImageViewerの初期化完了");
         viewer
@@ -208,14 +247,8 @@ impl ImageViewer {
         }
     }
 
-    fn update_scale(&mut self, ctx: &egui::Context) {
-        if let (Some(available_size), Some(image_size)) = (self.available_size, self.image_size) {
-            let image_size = Vec2::new(image_size[0] as f32, image_size[1] as f32);
-            let scale_x = available_size.x / image_size.x;
-            let scale_y = available_size.y / image_size.y;
-            self.scale = scale_x.min(scale_y);
-            self.position = Vec2::ZERO;
-        }
+    fn update_scale(&mut self, _ctx: &egui::Context) {
+        // Scale handling is now done in the update method
     }
 
     fn load_image(&mut self, path: &Path, ctx: &egui::Context) {
@@ -272,14 +305,32 @@ impl ImageViewer {
     }
 
     fn load_adjacent_image(&mut self, ctx: &egui::Context, next: bool) {
-        if let Some(index) = self.current_index.checked_sub(1) {
+        if let Some(current_path) = &self.current_path {
+            let current_index = self
+                .image_list
+                .iter()
+                .position(|p| p == current_path)
+                .unwrap_or(0);
+
             let new_index = if next {
-                (index + 1) % self.image_list.len()
+                if current_index + 1 < self.image_list.len() {
+                    current_index + 1
+                } else {
+                    0
+                }
             } else {
-                (index + self.image_list.len() - 1) % self.image_list.len()
+                if current_index > 0 {
+                    current_index - 1
+                } else {
+                    self.image_list.len() - 1
+                }
             };
-            let path = self.image_list[new_index].clone();
-            self.load_image(&path, ctx);
+
+            if let Some(path) = self.image_list.get(new_index).cloned() {
+                let current_scale = self.scale;  // 現在の拡大率を保存
+                self.load_image(&path, ctx);
+                self.scale = current_scale;  // 拡大率を復元
+            }
         }
     }
 
@@ -445,81 +496,152 @@ impl ImageViewer {
             }
         }
 
-        // Handle keyboard input
-        egui::CentralPanel::default().show(ctx, |ui| {
-            self.handle_keyboard_input(ui);
-        });
+        // Handle dropped files
+        if !self.dropped_files.is_empty() {
+            if let Some(path) = self.dropped_files.pop() {
+                if let Ok(file_data) = std::fs::read(&path) {
+                    if let Ok(img) = image::load_from_memory(&file_data) {
+                        let size = [img.width(), img.height()];
+                        let image_buffer = img.to_rgba8();
+                        let pixels = image_buffer.as_flat_samples();
 
-        // タイトルを更新
-        if let Some(image) = &self.current_image {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(
-                format!("Simple Image Viewer - {}% - {}", (self.scale * 100.0) as i32, image.path.display())
-            ));
-        }
-
-        // Draw image
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Draw checker background
-            self.draw_checker_background(ui);
-
-            // Draw image
-            if let Some(image) = &self.current_image {
-                let rect = ui.max_rect();
-                let image_size = Vec2::new(
-                    image.texture.size()[0] as f32,
-                    image.texture.size()[1] as f32,
-                );
-
-                let scaled_size = image_size * self.scale;
-                let min_pos = rect.center() - scaled_size * 0.5 + self.position;
-
-                ui.put(
-                    rect,
-                    egui::Image::new(&image.texture)
-                        .min_size(scaled_size)
-                        .max_size(scaled_size)
-                        .translate(min_pos - rect.min.to_vec2()),
-                );
-
-                // Handle drag
-                if ui.rect_contains_pointer(rect) {
-                    if ui.input(|i| i.pointer.secondary_down()) {
-                        if let Some(delta) = ui.input(|i| i.pointer.delta()) {
-                            self.position += delta;
-                        }
-                    }
-
-                    // Handle zoom
-                    if let Some(hover_pos) = ui.ctx().pointer_hover_pos() {
-                        ui.input(|i| {
-                            let zoom_delta = i.scroll_delta.y / 1000.0;
-                            if zoom_delta != 0.0 {
-                                let old_scale = self.scale;
-                                self.scale *= 1.0 + zoom_delta;
-                                self.scale = self.scale.clamp(0.1, 10.0);
-
-                                // Adjust position to zoom towards cursor
-                                let scale_delta = self.scale - old_scale;
-                                let rect_center = rect.center();
-                                let cursor_offset = hover_pos - rect_center;
-                                let size_delta = image_size * scale_delta;
-                                self.position -= size_delta * 0.5;
-                                self.position -= cursor_offset * (scale_delta / old_scale);
-
-                                // タイトルを更新
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Title(
-                                    format!("Simple Image Viewer - {}% - {}", (self.scale * 100.0) as i32, image.path.display())
-                                ));
-                            }
+                        let path_clone = path.clone();
+                        self.current_image = Some(LoadedImage {
+                            texture: ctx.load_texture(
+                                "image",
+                                egui::ColorImage::from_rgba_unmultiplied(
+                                    [size[0] as usize, size[1] as usize],
+                                    pixels.as_slice(),
+                                ),
+                                egui::TextureOptions::default(),
+                            ),
+                            path: path_clone.clone(),
                         });
+                        self.current_path = Some(path_clone.clone());
+                        self.update_image_list(&path_clone);
                     }
                 }
             }
+        }
+
+        // Handle file drops
+        ctx.input(|i| {
+            if !i.raw.dropped_files.is_empty() {
+                self.dropped_files = i.raw.dropped_files.iter()
+                    .filter_map(|file| file.path.clone())
+                    .collect();
+            }
+        });
+
+        // Update title
+        if let Some(image) = &self.current_image {
+            ctx.set_visuals(egui::Visuals::dark());
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                format!("Simple Image Viewer - {}% - {}", 
+                    (self.scale * 100.0) as i32,
+                    image.path.display()
+                )
+            ));
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if let Some(image) = &self.current_image {
+                let available_size = ui.available_size();
+                let image_size = image.texture.size_vec2();
+                let scaled_size = image_size * self.scale;
+
+                // Draw checker background
+                self.draw_checker_background(ui);
+
+                // Center the image in the available space
+                let offset = (available_size - scaled_size) * 0.5 + self.pan_offset;
+                let image_rect = Rect::from_min_size(
+                    ui.min_rect().min + offset,
+                    scaled_size,
+                );
+
+                // Draw the image
+                ui.allocate_ui_at_rect(image_rect, |ui| {
+                    ui.add(egui::Image::new(&image.texture).fit_to_exact_size(scaled_size));
+                });
+
+                // Handle panning with middle mouse button
+                if ui.input(|i| i.pointer.middle_down()) {
+                    self.pan_offset += ui.input(|i| i.pointer.delta());
+                }
+
+                // Handle zooming with mouse wheel
+                if let Some(hover_pos) = ui.rect_contains_pointer(image_rect).then(|| ui.input(|i| i.pointer.hover_pos())) {
+                    if let Some(hover_pos) = hover_pos {
+                        let zoom_delta = ui.input(|i| i.scroll_delta.y / 1000.0);
+                        if zoom_delta != 0.0 {
+                            let old_scale = self.scale;
+                            self.scale *= 1.0 + zoom_delta;
+                            self.scale = self.scale.clamp(0.1, 10.0);
+
+                            // Adjust position to zoom towards cursor
+                            let scale_delta = self.scale - old_scale;
+                            let image_center = image_rect.center();
+                            let cursor_offset = hover_pos - image_center;
+                            let size_delta = image_size * scale_delta;
+                            self.pan_offset -= size_delta * 0.5;
+                            self.pan_offset -= cursor_offset * (scale_delta / old_scale);
+                        }
+                    }
+                }
+            } else {
+                // 画像が読み込まれていない場合は中央にOpen Fileボタンを表示
+                let available_size = ui.available_size();
+                let button_size = Vec2::new(200.0, 50.0);
+                let rect = Rect::from_center_size(
+                    ui.min_rect().center(),
+                    button_size,
+                );
+
+                ui.allocate_ui_at_rect(rect, |ui| {
+                    if ui.button("Open File").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "bmp"])
+                            .pick_file()
+                        {
+                            if let Ok(file_data) = std::fs::read(&path) {
+                                if let Ok(img) = image::load_from_memory(&file_data) {
+                                    let size = [img.width(), img.height()];
+                                    let image_buffer = img.to_rgba8();
+                                    let pixels = image_buffer.as_flat_samples();
+
+                                    let path_clone = path.clone();
+                                    self.current_image = Some(LoadedImage {
+                                        texture: ctx.load_texture(
+                                            "image",
+                                            egui::ColorImage::from_rgba_unmultiplied(
+                                                [size[0] as usize, size[1] as usize],
+                                                pixels.as_slice(),
+                                            ),
+                                            egui::TextureOptions::default(),
+                                        ),
+                                        path: path_clone.clone(),
+                                    });
+                                    self.current_path = Some(path_clone.clone());
+                                    self.update_image_list(&path_clone);
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Handle keyboard input for navigation
+            self.handle_keyboard_input(ui);
         });
     }
 }
 
-impl eframe::App for ImageViewer {}
+impl eframe::App for ImageViewer {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update(ctx, _frame);
+    }
+}
 
 fn create_fallback_icon() -> IconData {
     IconData {

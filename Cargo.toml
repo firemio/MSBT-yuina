@@ -16,13 +16,15 @@ panic = 'abort'     # パニック時のスタックトレース機能を無効�
 strip = true        # デバッグシンボルを削除
 
 [dependencies]
-eframe = { version = "0.24.1", default-features = false, features = ["default_fonts", "glow"] }
+eframe = "0.24.1"
+image = "0.24.7"
+log = "0.4.20"
+env_logger = "0.10.1"
+ico = "0.3.0"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8.8"
+rfd = "0.12.1"
 egui = { version = "0.24.1", default-features = false }
-image = { version = "0.24.7", default-features = false, features = ["webp", "jpeg", "png"] }
-rfd = { version = "0.12.1", default-features = false }
 winapi = { version = "0.3.9", features = ["winuser", "windef"] }
-log = { version = "0.4", features = ["release_max_level_info"] }
-env_logger = { version = "0.10", default-features = false }
-ico = { version = "0.3.0", default-features = false }
 log4rs = "1.2.0"
 chrono = "0.4"
