@@ -24,3 +24,5 @@ winapi = { version = "0.3.9", features = ["winuser", "windef"] }
 log = { version = "0.4", features = ["release_max_level_info"] }
 env_logger = { version = "0.10", default-features = false }
 ico = { version = "0.3.0", default-features = false }
+log4rs = "1.2.0"
+chrono = "0.4"
