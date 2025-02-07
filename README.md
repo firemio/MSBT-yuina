@@ -19,6 +19,7 @@ rust製の軽量画像ビューアーです。画像をウィンドウサイズ�
 - GIF (.gif)
 - WebP (.webp)
 - BMP (.bmp)
+- SVG (.svg)
 
 ## 使い方
 

@@ -28,3 +28,6 @@ egui = { version = "0.24.1", default-features = false }
 winapi = { version = "0.3.9", features = ["winuser", "windef"] }
 log4rs = "1.2.0"
 chrono = "0.4"
+resvg = "0.44.0"
+usvg = "0.44.0"
+tiny-skia = "0.11.3"
