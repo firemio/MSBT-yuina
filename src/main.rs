@@ -105,6 +105,18 @@ fn main() -> eframe::Result<()> {
     }
     info!("アプリケーション起動開始");
 
+    // コマンドライン引数を取得
+    let args: Vec<String> = std::env::args().collect();
+    let initial_image = if args.len() > 1 {
+        Some(PathBuf::from(&args[1]))
+    } else {
+        None
+    };
+    
+    if let Some(path) = &initial_image {
+        info!("コマンドライン引数で指定された画像: {}", path.display());
+    }
+
     let options = match create_app_options() {
         Ok(opt) => opt,
         Err(e) => {
@@ -119,7 +131,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             info!("アプリケーションコンテキストの作成開始");
-            Box::new(ImageViewer::new(cc))
+            Box::new(ImageViewer::new(cc, initial_image))
         }),
     )
 }
@@ -175,9 +187,9 @@ struct ImageViewer {
 }
 
 impl ImageViewer {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, initial_image: Option<PathBuf>) -> Self {
         let config = ViewerConfig::load().unwrap_or_default();
-        Self {
+        let mut viewer = Self {
             config,
             current_image: None,
             current_path: None,
@@ -186,7 +198,19 @@ impl ImageViewer {
             pan_offset: Vec2::ZERO,
             image_paths: Vec::new(),
             last_available_size: None,
+        };
+        
+        // 初期画像が指定されている場合は読み込み、かつディレクトリ内の画像一覧を更新する
+        if let Some(path) = initial_image {
+            if path.exists() {
+                viewer.load_image(&path, &cc.egui_ctx);
+                viewer.update_image_list(&path); // ← この呼び出しを追加して、ファイル一覧を取得
+            } else {
+                error!("指定された画像が見つかりません: {}", path.display());
+            }
         }
+        
+        viewer
     }
 
     /// 画像サイズに合わせ、利用可能領域全体に収まる scale を計算する
@@ -359,8 +383,8 @@ impl ImageViewer {
     /// ・ドラッグ＆ドロップによるファイル読み込み  
     /// ・メニューバー（File / Options）の表示  
     /// ・"fitwindow" モードの場合、ウィンドウサイズ変更時に scale 再計算  
-    /// ・SVG は、現在の scale と前回レンダリング時の scale の差が ±5%以上なら再レンダリングを実施
-    /// ・Fキーを押すと位置をリセットしてフィットウィンドウ表示、0キーを押すと100%（scale=1.0）表示
+    /// ・SVG は、現在の scale と前回レンダリング時の scale の差が ±5%以上なら再レンダリングを実施  
+    /// ・Fキーを押すと位置リセット＆フィットウィンドウ表示、0キーを押すと100%（scale=1.0）表示
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ドラッグ＆ドロップ対応
         let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
