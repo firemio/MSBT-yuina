@@ -33,10 +33,10 @@ rust製の軽量画像ビューアーです。画像をウィンドウサイズ�
 
 ```bash
 # Windows
-simple-image-viewer.exe path/to/image.jpg
+MSBT-yuina.exe path/to/image.jpg
 
 # Linux/macOS
-./simple-image-viewer path/to/image.jpg
+./MSBT-yuina path/to/image.jpg
 ```
 
 ### 操作方法
