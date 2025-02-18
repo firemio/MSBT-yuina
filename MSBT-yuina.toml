@@ -1,3 +1,8 @@
+# 初期表示モード: "fit"=画面に合わせて表示, "original"=原寸大(100%)
 initial_display_mode = "original"
+
+# デバッグログを有効にするかどうか
 enable_debug_log = false
-wheel_zoom_factor = 0.009999999776482582
+
+# マウスホイールの拡大率（1回の回転あたりの倍率）
+wheel_zoom_factor = 0.005

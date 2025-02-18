@@ -56,6 +56,7 @@ impl ViewerConfig {
         let config_file = format!("{}.toml", exe_name);
         let config_str = fs::read_to_string(&config_file)?;
         let config: ViewerConfig = toml::from_str(&config_str)?;
+        info!("設定を読み込みました: wheel_zoom_factor = {}", config.wheel_zoom_factor);
         Ok(config)
     }
 
@@ -66,8 +67,23 @@ impl ViewerConfig {
             .ok_or("Failed to get executable name")?
             .to_string_lossy();
         let config_file = format!("{}.toml", exe_name);
-        let toml_str = toml::to_string(self)?;
-        fs::write(config_file, toml_str)?;
+        
+        // 設定ファイルのテンプレート
+        let config_template = format!(
+            "# 初期表示モード: \"fit\"=画面に合わせて表示, \"original\"=原寸大(100%)\n\
+             initial_display_mode = \"{}\"\n\
+             \n\
+             # デバッグログを有効にするかどうか\n\
+             enable_debug_log = {}\n\
+             \n\
+             # マウスホイールの拡大率（1回の回転あたりの倍率）\n\
+             wheel_zoom_factor = {}\n",
+            self.initial_display_mode,
+            self.enable_debug_log,
+            self.wheel_zoom_factor
+        );
+        
+        fs::write(config_file, config_template)?;
         Ok(())
     }
 }
@@ -712,7 +728,7 @@ impl ImageViewer {
 
                 let wheel_delta = ui.input(|i| i.scroll_delta.y);
                 if wheel_delta != 0.0 {
-                    let zoom_factor = (1.0 + wheel_delta * self.config.wheel_zoom_factor).clamp(0.9, 1.1);
+                    let zoom_factor = 1.0 + wheel_delta * self.config.wheel_zoom_factor;
                     let new_scale = (self.scale * zoom_factor).clamp(0.1, 10.0);
                     self.scale = new_scale;
 
