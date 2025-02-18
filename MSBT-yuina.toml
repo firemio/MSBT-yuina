@@ -1,5 +1,3 @@
-# 初期表示モード: "fit"=画面に合わせて表示, "original"=原寸大(100%)
-initial_display_mode = "fit"
-
-# デバッグログを有効にするかどうか
+initial_display_mode = "original"
 enable_debug_log = false
+wheel_zoom_factor = 0.009999999776482582

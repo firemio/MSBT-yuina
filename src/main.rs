@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use eframe::egui::{self, Color32, Key, Rect, Vec2};
+use eframe::egui::{self, Color32, Key, Rect, Vec2, Pos2};
 use egui::IconData;
 use std::fs;
 use std::io::Cursor;
@@ -27,6 +27,13 @@ pub struct ViewerConfig {
     /// デバッグログを有効にするかどうか
     #[serde(default)]
     pub enable_debug_log: bool,
+    /// マウスホイールの拡大率（1回の回転あたりの倍率）
+    #[serde(default = "default_wheel_zoom_factor")]
+    pub wheel_zoom_factor: f32,
+}
+
+fn default_wheel_zoom_factor() -> f32 {
+    0.001
 }
 
 impl Default for ViewerConfig {
@@ -34,6 +41,7 @@ impl Default for ViewerConfig {
         Self {
             initial_display_mode: "fitwindow".to_string(),
             enable_debug_log: false,
+            wheel_zoom_factor: default_wheel_zoom_factor(),
         }
     }
 }
@@ -174,6 +182,142 @@ enum LoadedImage {
     },
 }
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum GestureDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+struct MouseGesture {
+    is_active: bool,
+    last_pos: Option<Vec2>,
+    directions: Vec<GestureDirection>,
+    threshold: f32,
+}
+
+impl MouseGesture {
+    fn new() -> Self {
+        Self {
+            is_active: false,
+            last_pos: None,
+            directions: Vec::new(),
+            threshold: 20.0, // スワイプを検出する最小距離
+        }
+    }
+
+    fn reset(&mut self) {
+        self.is_active = false;
+        self.last_pos = None;
+        self.directions.clear();
+    }
+
+    fn get_action(&self) -> Option<String> {
+        if self.directions.len() == 1 {
+            match self.directions[0] {
+                GestureDirection::Left => Some("<<<".to_string()),
+                GestureDirection::Right => Some(">>>".to_string()),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    fn update(&mut self, mouse_pos: Vec2, right_button: bool) -> Option<String> {
+        let mut action = None;
+        if right_button {
+            if !self.is_active {
+                self.is_active = true;
+                self.last_pos = Some(mouse_pos);
+            } else if let Some(last_pos) = self.last_pos {
+                let delta = mouse_pos - last_pos;
+                if delta.length() >= self.threshold {
+                    let direction = if delta.x.abs() > delta.y.abs() {
+                        if delta.x > 0.0 {
+                            Some(GestureDirection::Right)
+                        } else {
+                            Some(GestureDirection::Left)
+                        }
+                    } else {
+                        if delta.y > 0.0 {
+                            Some(GestureDirection::Down)
+                        } else {
+                            Some(GestureDirection::Up)
+                        }
+                    };
+
+                    if let Some(dir) = direction {
+                        if self.directions.len() < 5 && 
+                           self.directions.last().map_or(true, |last| *last != dir) {
+                            self.directions.push(dir);
+                        }
+                    }
+                    self.last_pos = Some(mouse_pos);
+                }
+            }
+        } else if self.is_active {
+            // 右クリックが離されたときにアクションを取得
+            action = self.get_action();
+            self.reset();
+        }
+        action
+    }
+
+    fn draw(&self, ui: &mut egui::Ui, center: Pos2) {
+        if !self.is_active {
+            return;
+        }
+
+        let painter = ui.painter();
+        let text_color = Color32::from_rgb(255, 255, 255);
+        let arrow_color = Color32::from_rgb(200, 200, 200);
+        let font_size = 24.0;
+        let spacing = 30.0;
+
+        // 半透明の黒背景を描画
+        let background_rect = Rect::from_center_size(
+            center,
+            Vec2::new(spacing * 5.0, font_size * 3.0),
+        );
+        painter.rect_filled(
+            background_rect,
+            0.0,
+            Color32::from_rgba_premultiplied(0, 0, 0, 180),
+        );
+
+        // 方向の矢印を描画
+        for (i, direction) in self.directions.iter().enumerate().take(5) {
+            let pos = center + Vec2::new((i as f32 - 2.0) * spacing, 0.0);
+            let arrow = match direction {
+                GestureDirection::Left => "←",
+                GestureDirection::Right => "→",
+                GestureDirection::Up => "↑",
+                GestureDirection::Down => "↓",
+            };
+            painter.text(
+                pos,
+                egui::Align2::CENTER_CENTER,
+                arrow,
+                egui::FontId::monospace(font_size),
+                arrow_color,
+            );
+        }
+
+        // アクションを描画
+        if let Some(action) = self.get_action() {
+            painter.text(
+                center + Vec2::new(0.0, 30.0),
+                egui::Align2::CENTER_CENTER,
+                &action,
+                egui::FontId::monospace(font_size),
+                text_color,
+            );
+        }
+    }
+}
+
 struct ImageViewer {
     config: ViewerConfig,
     current_image: Option<LoadedImage>,
@@ -184,6 +328,7 @@ struct ImageViewer {
     image_paths: Vec<PathBuf>,
     // 前回の利用可能なウィンドウサイズ（"fitwindow" モードで使用）
     last_available_size: Option<Vec2>,
+    mouse_gesture: MouseGesture,
 }
 
 impl ImageViewer {
@@ -198,6 +343,7 @@ impl ImageViewer {
             pan_offset: Vec2::ZERO,
             image_paths: Vec::new(),
             last_available_size: None,
+            mouse_gesture: MouseGesture::new(),
         };
         
         // 初期画像が指定されている場合は読み込み、かつディレクトリ内の画像一覧を更新する
@@ -411,19 +557,32 @@ impl ImageViewer {
                     }
                 });
                 ui.menu_button("Options", |ui| {
-                    ui.label("Display Mode:");
-                    ui.selectable_value(
-                        &mut self.config.initial_display_mode,
-                        "fitwindow".to_string(),
-                        "Fit Window",
-                    );
-                    ui.selectable_value(
-                        &mut self.config.initial_display_mode,
-                        "original".to_string(),
-                        "Original",
-                    );
-                    ui.checkbox(&mut self.config.enable_debug_log, "Enable Debug Log");
-                    if ui.button("Save Options").clicked() {
+                    ui.group(|ui| {
+                        ui.label("Display Mode");
+                        ui.separator();
+                        ui.radio_value(
+                            &mut self.config.initial_display_mode,
+                            "fitwindow".to_string(),
+                            "Fit Window",
+                        );
+                        ui.radio_value(
+                            &mut self.config.initial_display_mode,
+                            "original".to_string(),
+                            "Original Size",
+                        );
+                    });
+
+                    ui.add_space(8.0);
+
+                    ui.group(|ui| {
+                        ui.label("Other Settings");
+                        ui.separator();
+                        ui.checkbox(&mut self.config.enable_debug_log, "Enable Debug Log");
+                    });
+
+                    ui.add_space(8.0);
+
+                    if ui.button("Save Settings").clicked() {
                         match self.config.save() {
                             Ok(_) => info!("設定が保存されました"),
                             Err(e) => error!("設定の保存に失敗しました: {}", e),
@@ -521,39 +680,72 @@ impl ImageViewer {
                     }
                 }
 
-                let mut scale_changed = false;
-                let mut scale_delta = 0.0;
+                let old_scale = self.scale;
+
                 if ui.input(|i| i.key_pressed(Key::PlusEquals)) {
-                    scale_changed = true;
-                    scale_delta = self.scale * 0.1;
                     self.scale = (self.scale * 1.1).clamp(0.1, 10.0);
+
+                    // 画面中央を基準に拡大
+                    let image_center = available_rect.center().to_vec2();
+                    let image_pos = available_rect.min.to_vec2() + (available_rect.size() - scaled_size) * 0.5 + self.pan_offset;
+                    let offset_from_center = image_pos - image_center;
+                    self.pan_offset = image_center + offset_from_center * (self.scale / old_scale) - available_rect.min.to_vec2() - (available_rect.size() - scaled_size * (self.scale / old_scale)) * 0.5;
                 } else if ui.input(|i| i.key_pressed(Key::Minus)) {
-                    scale_changed = true;
-                    scale_delta = -self.scale * 0.1;
                     self.scale = (self.scale / 1.1).clamp(0.1, 10.0);
+
+                    // 画面中央を基準に縮小
+                    let image_center = available_rect.center().to_vec2();
+                    let image_pos = available_rect.min.to_vec2() + (available_rect.size() - scaled_size) * 0.5 + self.pan_offset;
+                    let offset_from_center = image_pos - image_center;
+                    self.pan_offset = image_center + offset_from_center * (self.scale / old_scale) - available_rect.min.to_vec2() - (available_rect.size() - scaled_size * (self.scale / old_scale)) * 0.5;
                 }
+
                 let response = ui.interact(
                     available_rect,
                     ui.id().with("drag_area"),
                     egui::Sense::click_and_drag(),
                 );
-                if response.dragged() {
+
+                if response.dragged() && !ui.input(|i| i.pointer.secondary_down()) {
                     self.pan_offset += response.drag_delta();
                 }
+
                 let wheel_delta = ui.input(|i| i.scroll_delta.y);
                 if wheel_delta != 0.0 {
-                    scale_changed = true;
-                    scale_delta = wheel_delta * 0.001 * self.scale;
-                    self.scale = (self.scale * (1.0 + wheel_delta * 0.001)).clamp(0.1, 10.0);
-                }
-                if scale_changed {
-                    if let Some(hover_pos) = response.hover_pos() {
-                        let image_center = available_rect.center().to_vec2();
-                        let cursor_offset = hover_pos.to_vec2() - image_center;
-                        let size_delta = texture_size * scale_delta;
-                        self.pan_offset -= size_delta * 0.5;
-                        self.pan_offset -= cursor_offset * scale_delta / (self.scale - scale_delta);
+                    let zoom_factor = (1.0 + wheel_delta * self.config.wheel_zoom_factor).clamp(0.9, 1.1);
+                    let new_scale = (self.scale * zoom_factor).clamp(0.1, 10.0);
+                    self.scale = new_scale;
+
+                    // マウスカーソル位置を基準に拡大縮小
+                    if let Some(cursor_pos) = response.hover_pos() {
+                        let cursor_pos = cursor_pos.to_vec2();
+                        let image_pos = available_rect.min.to_vec2() + (available_rect.size() - scaled_size) * 0.5 + self.pan_offset;
+                        
+                        // カーソルから画像の相対位置を計算
+                        let rel_pos = (cursor_pos - image_pos) / old_scale;
+                        
+                        // 新しい画像位置を計算
+                        let new_image_pos = cursor_pos - rel_pos * self.scale;
+                        self.pan_offset = new_image_pos - available_rect.min.to_vec2() - (available_rect.size() - scaled_size * (self.scale / old_scale)) * 0.5;
                     }
+                }
+
+                // マウスジェスチャーの更新と判定
+                let mouse_pos = ui.input(|i| i.pointer.hover_pos()).unwrap_or(Pos2::ZERO);
+                let right_button = ui.input(|i| i.pointer.secondary_down());
+                
+                // updateの戻り値でアクションを受け取る
+                if let Some(action) = self.mouse_gesture.update(mouse_pos.to_vec2(), right_button) {
+                    match action.as_str() {
+                        "<<<" => self.load_adjacent_image(ui.ctx(), false),
+                        ">>>" => self.load_adjacent_image(ui.ctx(), true),
+                        _ => {}
+                    }
+                }
+
+                // マウスジェスチャーの描画
+                if self.mouse_gesture.is_active {
+                    self.mouse_gesture.draw(ui, available_rect.center());
                 }
             }
         });
