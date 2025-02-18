@@ -18,11 +18,12 @@ use tiny_skia::Pixmap;
 use usvg::{Options, Tree};
 use resvg;
 use rfd;
+use image;
 
 /// 設定ファイル（TOML）の内容
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ViewerConfig {
-    /// "fitwindow" でウィンドウサイズに合わせて表示、"original" で画像本来のサイズで表示
+    /// "fit" でウィンドウサイズに合わせて表示、"original" で画像本来のサイズで表示
     pub initial_display_mode: String,
     /// デバッグログを有効にするかどうか
     #[serde(default)]
@@ -39,7 +40,7 @@ fn default_wheel_zoom_factor() -> f32 {
 impl Default for ViewerConfig {
     fn default() -> Self {
         Self {
-            initial_display_mode: "fitwindow".to_string(),
+            initial_display_mode: "fit".to_string(),
             enable_debug_log: false,
             wheel_zoom_factor: default_wheel_zoom_factor(),
         }
@@ -122,9 +123,22 @@ fn main() -> eframe::Result<()> {
         error!("アプリケーションがパニックで終了: {}", panic_info);
     }));
 
-    let config = ViewerConfig::load().unwrap_or_default();
+    // 設定ファイルの読み込み
+    let config = match ViewerConfig::load() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("設定ファイルの読み込みに失敗しました: {}。デフォルト設定を使用します。", e);
+            ViewerConfig::default()
+        }
+    };
+
+    // ログの初期化
     if let Err(e) = init_logging(&config) {
         eprintln!("ログの初期化に失敗: {}", e);
+        rfd::MessageDialog::new()
+            .set_title("エラー")
+            .set_description(&format!("ログの初期化に失敗: {}", e))
+            .show();
         return Ok(());
     }
     info!("アプリケーション起動開始");
@@ -132,7 +146,17 @@ fn main() -> eframe::Result<()> {
     // コマンドライン引数を取得
     let args: Vec<String> = std::env::args().collect();
     let initial_image = if args.len() > 1 {
-        Some(PathBuf::from(&args[1]))
+        let path = PathBuf::from(&args[1]);
+        if !path.exists() {
+            let message = format!("指定された画像が見つかりません: {}", path.display());
+            error!("{}", message);
+            eprintln!("エラー: {}", message);
+            rfd::MessageDialog::new()
+                .set_title("エラー")
+                .set_description(&message)
+                .show();
+        }
+        Some(path)
     } else {
         None
     };
@@ -144,7 +168,13 @@ fn main() -> eframe::Result<()> {
     let options = match create_app_options() {
         Ok(opt) => opt,
         Err(e) => {
-            error!("アプリケーション設定の作成に失敗: {}", e);
+            let message = format!("アプリケーション設定の作成に失敗: {}", e);
+            error!("{}", message);
+            eprintln!("エラー: {}", message);
+            rfd::MessageDialog::new()
+                .set_title("エラー")
+                .set_description(&message)
+                .show();
             return Ok(());
         }
     };
@@ -153,9 +183,9 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "MSBT-yuina",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             info!("アプリケーションコンテキストの作成開始");
-            Box::new(ImageViewer::new(cc, initial_image))
+            Box::new(ImageViewer::new(cc, initial_image, config))
         }),
     )
 }
@@ -342,14 +372,13 @@ struct ImageViewer {
     scale: f32,
     pan_offset: Vec2,
     image_paths: Vec<PathBuf>,
-    // 前回の利用可能なウィンドウサイズ（"fitwindow" モードで使用）
+    // 前回の利用可能なウィンドウサイズ（"fit" モードで使用）
     last_available_size: Option<Vec2>,
     mouse_gesture: MouseGesture,
 }
 
 impl ImageViewer {
-    fn new(cc: &eframe::CreationContext<'_>, initial_image: Option<PathBuf>) -> Self {
-        let config = ViewerConfig::load().unwrap_or_default();
+    fn new(cc: &eframe::CreationContext<'_>, initial_image: Option<PathBuf>, config: ViewerConfig) -> Self {
         let mut viewer = Self {
             config,
             current_image: None,
@@ -366,7 +395,7 @@ impl ImageViewer {
         if let Some(path) = initial_image {
             if path.exists() {
                 viewer.load_image(&path, &cc.egui_ctx);
-                viewer.update_image_list(&path); // ← この呼び出しを追加して、ファイル一覧を取得
+                viewer.update_image_list(&path);
             } else {
                 error!("指定された画像が見つかりません: {}", path.display());
             }
@@ -386,93 +415,141 @@ impl ImageViewer {
             } else {
                 available_size.y / size[1] as f32
             };
+            info!("画面に合わせてスケールを設定: {}", self.scale);
         }
     }
 
-    /// 指定パスの画像を読み込み、拡大率、パン位置、画像サイズを更新する  
-    /// SVG の場合は、usvg::Tree を保持し、"fitwindow" モードならウィンドウ全体に収まる scale で初回レンダリングを行う
-    fn load_image(&mut self, path: &Path, ctx: &egui::Context) {
+    /// 指定パスの画像を読み込み、拡大率、パン位置、画像サイズを更新する
+    fn load_image(&mut self, path: &Path, ctx: &egui::Context) -> bool {
         info!("画像を読み込もうとしています: {:?}", path);
         self.pan_offset = Vec2::ZERO;
         self.scale = 1.0;
         self.image_size = None;
 
-        if let Some(ext) = path.extension() {
+        let result = if let Some(ext) = path.extension() {
             let ext = ext.to_string_lossy().to_lowercase();
             if ext == "svg" {
-                if let Ok(svg_data) = fs::read_to_string(path) {
-                    info!("SVGファイルを読み込みました: {} bytes", svg_data.len());
-                    let opt = Options::default();
-                    if let Ok(tree) = Tree::from_str(&svg_data, &opt) {
-                        let size = tree.size();
-                        let width = size.width() as u32;
-                        let height = size.height() as u32;
-                        info!("SVGサイズ: {}x{}", width, height);
-                        self.image_size = Some([width, height]);
-                        // update() 内で "fitwindow" モードの再計算が実施されるので、ここではscale=1.0の状態
-                        let desired_width = ((width as f32) * self.scale).ceil() as u32;
-                        let desired_height = ((height as f32) * self.scale).ceil() as u32;
-                        if let Some(mut pixmap) = Pixmap::new(desired_width, desired_height) {
-                            let scale_factor = desired_width as f32 / width as f32;
-                            let transform = usvg::Transform::from_scale(scale_factor, scale_factor);
-                            resvg::render(&tree, transform, &mut pixmap.as_mut());
-                            let image = egui::ColorImage::from_rgba_unmultiplied(
-                                [desired_width as usize, desired_height as usize],
-                                pixmap.data(),
-                            );
-                            let texture = ctx.load_texture(
-                                path.to_string_lossy().to_string(),
-                                image,
-                                Default::default(),
-                            );
-                            self.current_image = Some(LoadedImage::Svg {
-                                tree,
-                                original_size: [width, height],
-                                texture,
-                                last_scale: self.scale,
-                                path: path.to_path_buf(),
-                            });
-                            info!("SVGの読み込みが完了しました");
-                        }
-                    }
-                }
+                self.load_svg(path, ctx)
             } else {
-                // 通常画像の場合
-                if let Ok(file) = fs::File::open(path) {
-                    let mut reader = std::io::BufReader::new(file);
-                    if let Ok(format) = image::ImageFormat::from_path(path) {
-                        if let Ok(image) = image::load(&mut reader, format) {
-                            let image = image.to_rgba8();
-                            let width = image.width() as usize;
-                            let height = image.height() as usize;
-                            self.image_size = Some([width as u32, height as u32]);
-                            if self.config.initial_display_mode == "fitwindow" {
-                                self.fit_to_screen(ctx);
-                            }
-                            let size = [width, height];
-                            let pixels = image.into_vec();
-                            let color_image =
-                                egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-                            let texture = ctx.load_texture(
-                                path.to_string_lossy().to_string(),
-                                color_image,
-                                Default::default(),
-                            );
-                            self.current_image = Some(LoadedImage::Raster {
-                                texture,
-                                path: path.to_path_buf(),
-                            });
-                            info!("画像の読み込みが完了しました");
-                        } else {
-                            error!("画像の読み込みに失敗しました: {:?}", path);
-                        }
-                    } else {
-                        error!("画像形式の判定に失敗しました: {:?}", path);
-                    }
-                }
+                self.load_raster(path, ctx)
+            }
+        } else {
+            let message = format!("サポートされていないファイル形式です: {}", path.display());
+            error!("{}", message);
+            rfd::MessageDialog::new()
+                .set_title("エラー")
+                .set_description(&message)
+                .show();
+            false
+        };
+
+        if result {
+            self.current_path = Some(path.to_path_buf());
+            // 画像の読み込みが成功したら、initial_display_modeに応じてスケールを設定
+            if self.config.initial_display_mode == "fit" {
+                self.fit_to_screen(ctx);
             }
         }
-        self.current_path = Some(path.to_path_buf());
+
+        result
+    }
+
+    fn load_svg(&mut self, path: &Path, ctx: &egui::Context) -> bool {
+        if let Ok(svg_data) = fs::read_to_string(path) {
+            info!("SVGファイルを読み込みました: {} bytes", svg_data.len());
+            let opt = Options::default();
+            if let Ok(tree) = Tree::from_str(&svg_data, &opt) {
+                let size = tree.size();
+                let width = size.width() as u32;
+                let height = size.height() as u32;
+                info!("SVGサイズ: {}x{}", width, height);
+                self.image_size = Some([width, height]);
+
+                // 初期レンダリング（scale=1.0）
+                if let Some(mut pixmap) = Pixmap::new(width, height) {
+                    resvg::render(&tree, usvg::Transform::default(), &mut pixmap.as_mut());
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [width as usize, height as usize],
+                        pixmap.data(),
+                    );
+                    let texture = ctx.load_texture(
+                        path.to_string_lossy().to_string(),
+                        image,
+                        Default::default(),
+                    );
+                    self.current_image = Some(LoadedImage::Svg {
+                        tree,
+                        original_size: [width, height],
+                        texture,
+                        last_scale: 1.0,
+                        path: path.to_path_buf(),
+                    });
+                    info!("SVGの読み込みが完了しました");
+                    true
+                } else {
+                    let message = format!("SVGの描画に失敗しました: メモリが不足している可能性があります");
+                    error!("{}", message);
+                    rfd::MessageDialog::new()
+                        .set_title("エラー")
+                        .set_description(&message)
+                        .show();
+                    false
+                }
+            } else {
+                let message = format!("SVGの解析に失敗しました: {}", path.display());
+                error!("{}", message);
+                rfd::MessageDialog::new()
+                    .set_title("エラー")
+                    .set_description(&message)
+                    .show();
+                false
+            }
+        } else {
+            let message = format!("SVGファイルの読み込みに失敗しました: {}", path.display());
+            error!("{}", message);
+            rfd::MessageDialog::new()
+                .set_title("エラー")
+                .set_description(&message)
+                .show();
+            false
+        }
+    }
+
+    fn load_raster(&mut self, path: &Path, ctx: &egui::Context) -> bool {
+        match image::open(path) {
+            Ok(image) => {
+                let image = image.to_rgba8();
+                let width = image.width() as usize;
+                let height = image.height() as usize;
+                self.image_size = Some([width as u32, height as u32]);
+                if self.config.initial_display_mode == "fit" {
+                    self.fit_to_screen(ctx);
+                }
+                let size = [width, height];
+                let pixels = image.into_vec();
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                let texture = ctx.load_texture(
+                    path.to_string_lossy().to_string(),
+                    color_image,
+                    Default::default(),
+                );
+                self.current_image = Some(LoadedImage::Raster {
+                    texture,
+                    path: path.to_path_buf(),
+                });
+                info!("画像の読み込みが完了しました");
+                true
+            }
+            Err(e) => {
+                let message = format!("画像の読み込みに失敗しました: {} - {}", path.display(), e);
+                error!("{}", message);
+                rfd::MessageDialog::new()
+                    .set_title("エラー")
+                    .set_description(&message)
+                    .show();
+                false
+            }
+        }
     }
 
     /// 現在の画像があるディレクトリ内の画像一覧を更新する
@@ -544,10 +621,10 @@ impl ImageViewer {
     /// アプリケーション更新処理  
     /// ・ドラッグ＆ドロップによるファイル読み込み  
     /// ・メニューバー（File / Options）の表示  
-    /// ・"fitwindow" モードの場合、ウィンドウサイズ変更時に scale 再計算  
+    /// ・"fit" モードの場合、ウィンドウサイズ変更時に scale 再計算  
     /// ・SVG は、現在の scale と前回レンダリング時の scale の差が ±5%以上なら再レンダリングを実施  
     /// ・Fキーを押すと位置リセット＆フィットウィンドウ表示、0キーを押すと100%（scale=1.0）表示
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context) {
         // ドラッグ＆ドロップ対応
         let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
         for dropped in dropped_files {
@@ -578,7 +655,7 @@ impl ImageViewer {
                         ui.separator();
                         ui.radio_value(
                             &mut self.config.initial_display_mode,
-                            "fitwindow".to_string(),
+                            "fit".to_string(),
                             "Fit Window",
                         );
                         ui.radio_value(
@@ -620,7 +697,7 @@ impl ImageViewer {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let available_rect = ui.available_rect_before_wrap();
-            if self.config.initial_display_mode == "fitwindow" {
+            if self.config.initial_display_mode == "fit" {
                 if self.last_available_size.map_or(true, |last| last != available_rect.size()) {
                     self.fit_to_screen(ctx);
                     self.last_available_size = Some(available_rect.size());
@@ -637,14 +714,15 @@ impl ImageViewer {
             }) = &mut self.current_image
             {
                 if self.scale > *last_scale * 1.05 || self.scale < *last_scale * 0.95 {
-                    let desired_width = ((original_size[0] as f32) * self.scale).ceil() as u32;
-                    let desired_height = ((original_size[1] as f32) * self.scale).ceil() as u32;
-                    if let Some(mut pixmap) = Pixmap::new(desired_width, desired_height) {
-                        let scale_factor = desired_width as f32 / original_size[0] as f32;
-                        let transform = usvg::Transform::from_scale(scale_factor, scale_factor);
-                        resvg::render(tree, transform, &mut pixmap.as_mut());
+                    let render_width = (original_size[0] as f32 * self.scale).ceil() as u32;
+                    let render_height = (original_size[1] as f32 * self.scale).ceil() as u32;
+                    
+                    info!("SVG再レンダリング: {}x{} (scale: {})", render_width, render_height, self.scale);
+                    
+                    if let Some(mut pixmap) = Pixmap::new(render_width, render_height) {
+                        resvg::render(tree, usvg::Transform::from_scale(self.scale, self.scale), &mut pixmap.as_mut());
                         let image = egui::ColorImage::from_rgba_unmultiplied(
-                            [desired_width as usize, desired_height as usize],
+                            [render_width as usize, render_height as usize],
                             pixmap.data(),
                         );
                         *texture = ctx.load_texture("svg_texture", image, Default::default());
@@ -675,13 +753,13 @@ impl ImageViewer {
 
                 // キー入力処理
                 if ui.input(|i| i.key_pressed(Key::ArrowRight)) {
-                    self.load_adjacent_image(ui.ctx(), true);
+                    self.load_adjacent_image(ctx, true);
                 } else if ui.input(|i| i.key_pressed(Key::ArrowLeft)) {
-                    self.load_adjacent_image(ui.ctx(), false);
+                    self.load_adjacent_image(ctx, false);
                 } else if ui.input(|i| i.key_pressed(Key::F)) {
                     // Fキー：位置リセット＆フィットウィンドウ表示
                     self.pan_offset = Vec2::ZERO;
-                    self.fit_to_screen(ui.ctx());
+                    self.fit_to_screen(ctx);
                 } else if ui.input(|i| i.key_pressed(Key::Num0)) {
                     // 0キー：位置リセット＆100%表示（scale = 1.0）
                     self.pan_offset = Vec2::ZERO;
@@ -691,9 +769,11 @@ impl ImageViewer {
                         .add_filter("Images", &["png", "jpg", "jpeg", "gif", "bmp", "svg"])
                         .pick_file()
                     {
-                        self.load_image(&file_path, ui.ctx());
+                        self.load_image(&file_path, ctx);
                         self.update_image_list(&file_path);
                     }
+                } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
 
                 let old_scale = self.scale;
@@ -753,8 +833,8 @@ impl ImageViewer {
                 // updateの戻り値でアクションを受け取る
                 if let Some(action) = self.mouse_gesture.update(mouse_pos.to_vec2(), right_button) {
                     match action.as_str() {
-                        "<<<" => self.load_adjacent_image(ui.ctx(), false),
-                        ">>>" => self.load_adjacent_image(ui.ctx(), true),
+                        "<<<" => self.load_adjacent_image(ctx, false),
+                        ">>>" => self.load_adjacent_image(ctx, true),
                         _ => {}
                     }
                 }
@@ -803,8 +883,8 @@ impl ImageViewer {
 }
 
 impl eframe::App for ImageViewer {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.update(ctx, frame);
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update(ctx);
     }
 }
 
