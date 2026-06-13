@@ -12,6 +12,7 @@ use log4rs::{
     encode::pattern::PatternEncoder,
 };
 use std::panic;
+use std::sync::Arc;
 use ico;
 use serde::{Deserialize, Serialize};
 use tiny_skia::Pixmap;
@@ -185,7 +186,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             info!("アプリケーションコンテキストの作成開始");
-            Box::new(ImageViewer::new(cc, initial_image, config))
+            Ok(Box::new(ImageViewer::new(cc, initial_image, config)))
         }),
     )
 }
@@ -204,8 +205,6 @@ fn create_app_options() -> Result<eframe::NativeOptions, Box<dyn std::error::Err
             .with_decorations(true)
             .with_visible(true),
         renderer: eframe::Renderer::Glow,
-        follow_system_theme: true,
-        default_theme: eframe::Theme::Dark,
         ..Default::default()
     };
     Ok(options)
@@ -375,6 +374,8 @@ struct ImageViewer {
     // 前回の利用可能なウィンドウサイズ（"fit" モードで使用）
     last_available_size: Option<Vec2>,
     mouse_gesture: MouseGesture,
+    // SVG テキスト描画用のフォントDB（初回SVG読み込み時にシステムフォントを一度だけロードしてキャッシュ）
+    fontdb: Option<Arc<usvg::fontdb::Database>>,
 }
 
 impl ImageViewer {
@@ -389,6 +390,7 @@ impl ImageViewer {
             image_paths: Vec::new(),
             last_available_size: None,
             mouse_gesture: MouseGesture::new(),
+            fontdb: None,
         };
         
         // 初期画像が指定されている場合は読み込み、かつディレクトリ内の画像一覧を更新する
@@ -457,7 +459,20 @@ impl ImageViewer {
     fn load_svg(&mut self, path: &Path, ctx: &egui::Context) -> bool {
         if let Ok(svg_data) = fs::read_to_string(path) {
             info!("SVGファイルを読み込みました: {} bytes", svg_data.len());
-            let opt = Options::default();
+            // SVG 内のテキストはパース時にフォントDBを使ってパス化される。
+            // フォントDBが空だと文字が一切描画されないため、システムフォントをロードしておく。
+            // 構築コストが高いので初回のみ作成し、以降は Arc を共有して再利用する。
+            let fontdb = self
+                .fontdb
+                .get_or_insert_with(|| {
+                    let mut db = usvg::fontdb::Database::new();
+                    db.load_system_fonts();
+                    info!("システムフォントをロードしました: {} faces", db.len());
+                    Arc::new(db)
+                })
+                .clone();
+            let mut opt = Options::default();
+            opt.fontdb = fontdb;
             if let Ok(tree) = Tree::from_str(&svg_data, &opt) {
                 let size = tree.size();
                 let width = size.width() as u32;
@@ -766,7 +781,7 @@ impl ImageViewer {
                     self.scale = 1.0;
                 } else if ui.input(|i| i.key_pressed(Key::O)) {
                     if let Some(file_path) = rfd::FileDialog::new()
-                        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "bmp", "svg"])
+                        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "bmp", "svg", "heic", "heif"])
                         .pick_file()
                     {
                         self.load_image(&file_path, ctx);
@@ -778,7 +793,7 @@ impl ImageViewer {
 
                 let old_scale = self.scale;
 
-                if ui.input(|i| i.key_pressed(Key::PlusEquals)) {
+                if ui.input(|i| i.key_pressed(Key::Plus)) {
                     self.scale = (self.scale * 1.1).clamp(0.1, 10.0);
 
                     // 画面中央を基準に拡大
@@ -806,7 +821,7 @@ impl ImageViewer {
                     self.pan_offset += response.drag_delta();
                 }
 
-                let wheel_delta = ui.input(|i| i.scroll_delta.y);
+                let wheel_delta = ui.input(|i| i.raw_scroll_delta.y);
                 if wheel_delta != 0.0 {
                     let zoom_factor = 1.0 + wheel_delta * self.config.wheel_zoom_factor;
                     let new_scale = (self.scale * zoom_factor).clamp(0.1, 10.0);
