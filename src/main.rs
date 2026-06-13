@@ -376,10 +376,14 @@ struct ImageViewer {
     mouse_gesture: MouseGesture,
     // SVG テキスト描画用のフォントDB（初回SVG読み込み時にシステムフォントを一度だけロードしてキャッシュ）
     fontdb: Option<Arc<usvg::fontdb::Database>>,
+    // コマンドライン等で指定された初期画像。最初の update() フレームで読み込む（new() 内で
+    // 読み込むと、GL バックエンドが最大テクスチャサイズを報告する前なので、大きな画像で
+    // 「maximum texture side is 2048」パニックが起きる）。
+    pending_open: Option<PathBuf>,
 }
 
 impl ImageViewer {
-    fn new(cc: &eframe::CreationContext<'_>, initial_image: Option<PathBuf>, config: ViewerConfig) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>, initial_image: Option<PathBuf>, config: ViewerConfig) -> Self {
         let mut viewer = Self {
             config,
             current_image: None,
@@ -391,18 +395,18 @@ impl ImageViewer {
             last_available_size: None,
             mouse_gesture: MouseGesture::new(),
             fontdb: None,
+            pending_open: None,
         };
-        
-        // 初期画像が指定されている場合は読み込み、かつディレクトリ内の画像一覧を更新する
+
+        // 初期画像は new() 内ではなく最初の update() フレームで読み込む（理由は pending_open の定義参照）。
         if let Some(path) = initial_image {
             if path.exists() {
-                viewer.load_image(&path, &cc.egui_ctx);
-                viewer.update_image_list(&path);
+                viewer.pending_open = Some(path);
             } else {
                 error!("指定された画像が見つかりません: {}", path.display());
             }
         }
-        
+
         viewer
     }
 
@@ -447,10 +451,12 @@ impl ImageViewer {
 
         if result {
             self.current_path = Some(path.to_path_buf());
-            // 画像の読み込みが成功したら、initial_display_modeに応じてスケールを設定
-            if self.config.initial_display_mode == "fit" {
-                self.fit_to_screen(ctx);
-            }
+            // フィット表示は次フレームの update() に委ねる。
+            // ここで（＝ImageViewer::new() からの初回読み込み時に）fit_to_screen を呼ぶと
+            // Context::run() 前に ctx.available_rect() を呼ぶことになり、egui 0.31 が
+            // 「Called `available_rect()` before `Context::run()`」でパニックする。
+            // last_available_size を None に戻すと、次フレームで新しい画像に対して再フィットされる。
+            self.last_available_size = None;
         }
 
         result
@@ -532,14 +538,25 @@ impl ImageViewer {
 
     fn load_raster(&mut self, path: &Path, ctx: &egui::Context) -> bool {
         match image::open(path) {
-            Ok(image) => {
+            Ok(mut image) => {
+                // GPU の最大テクスチャ辺を超える画像はそのまま load_texture するとパニックするため、
+                // アスペクト比を保ったまま収まるよう縮小する（通常サイズの画像には影響しない）。
+                let max = ctx.input(|i| i.max_texture_side).max(1) as u32;
+                if image.width() > max || image.height() > max {
+                    info!(
+                        "画像がテクスチャ上限({0})を超過: {1}x{2} → 縮小",
+                        max,
+                        image.width(),
+                        image.height()
+                    );
+                    image = image.resize(max, max, image::imageops::FilterType::Triangle);
+                }
                 let image = image.to_rgba8();
                 let width = image.width() as usize;
                 let height = image.height() as usize;
                 self.image_size = Some([width as u32, height as u32]);
-                if self.config.initial_display_mode == "fit" {
-                    self.fit_to_screen(ctx);
-                }
+                // フィットは load_image 側で last_available_size=None を介して次フレームに委ねる
+                // （ここで fit_to_screen を呼ぶと初回フレーム前に available_rect() を触り得る）
                 let size = [width, height];
                 let pixels = image.into_vec();
                 let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
@@ -637,9 +654,17 @@ impl ImageViewer {
     /// ・ドラッグ＆ドロップによるファイル読み込み  
     /// ・メニューバー（File / Options）の表示  
     /// ・"fit" モードの場合、ウィンドウサイズ変更時に scale 再計算  
-    /// ・SVG は、現在の scale と前回レンダリング時の scale の差が ±5%以上なら再レンダリングを実施  
+    /// ・SVG は、拡大率に応じた表示解像度でラスタライズし直し、拡大してもボケないようにする
     /// ・Fキーを押すと位置リセット＆フィットウィンドウ表示、0キーを押すと100%（scale=1.0）表示
     fn update(&mut self, ctx: &egui::Context) {
+        // 初期画像の遅延読み込み（最初のフレームで一度だけ）。
+        // ここなら GL バックエンドが報告した正しい max_texture_side が使えるため、
+        // 大きな画像でもパニックしない。take() で一度きりにしてエラー時の無限リトライも防ぐ。
+        if let Some(path) = self.pending_open.take() {
+            self.load_image(&path, ctx);
+            self.update_image_list(&path);
+        }
+
         // ドラッグ＆ドロップ対応
         let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
         for dropped in dropped_files {
@@ -719,7 +744,9 @@ impl ImageViewer {
                 }
             }
 
-            // SVG の場合、現在の scale と前回レンダリング時の scale に ±5%以上の差があれば再レンダリング
+            // SVG はベクターなので、ラスタ画像のように1枚のテクスチャを引き伸ばすと
+            // 拡大時にボケる。表示する実ピクセル数（拡大率 × HiDPI の pixels_per_point）に
+            // 合わせて毎回ラスタライズし直し、常に 1:1 の鮮明な描画を保つ。
             if let Some(LoadedImage::Svg {
                 tree,
                 original_size,
@@ -728,20 +755,35 @@ impl ImageViewer {
                 ..
             }) = &mut self.current_image
             {
-                if self.scale > *last_scale * 1.05 || self.scale < *last_scale * 0.95 {
-                    let render_width = (original_size[0] as f32 * self.scale).ceil() as u32;
-                    let render_height = (original_size[1] as f32 * self.scale).ceil() as u32;
-                    
-                    info!("SVG再レンダリング: {}x{} (scale: {})", render_width, render_height, self.scale);
-                    
-                    if let Some(mut pixmap) = Pixmap::new(render_width, render_height) {
-                        resvg::render(tree, usvg::Transform::from_scale(self.scale, self.scale), &mut pixmap.as_mut());
+                let ppp = ctx.pixels_per_point();
+                // GPU テクスチャ上限を超えるとパニックするため、実機の max_texture_side で各辺をクランプ
+                // （メモリ暴走の保険も兼ねる）。
+                let max_dim = ctx.input(|i| i.max_texture_side).max(1) as f32;
+                let target_w =
+                    (original_size[0] as f32 * self.scale * ppp).round().clamp(1.0, max_dim) as u32;
+                let target_h =
+                    (original_size[1] as f32 * self.scale * ppp).round().clamp(1.0, max_dim) as u32;
+                let cur = texture.size();
+                // テクスチャ解像度が表示解像度とずれ、かつ前回描画から 2% 以上スケールが
+                // 変化したときだけ再生成する（連続ズーム中の過剰な再レンダリングを抑えつつ、
+                // 体感でボケない細かさを確保する）。
+                let size_mismatch = cur[0] as u32 != target_w || cur[1] as u32 != target_h;
+                let scale_changed = (self.scale - *last_scale).abs() > (*last_scale).max(0.01) * 0.02;
+                if size_mismatch && scale_changed {
+                    if let Some(mut pixmap) = Pixmap::new(target_w, target_h) {
+                        let sx = target_w as f32 / original_size[0] as f32;
+                        let sy = target_h as f32 / original_size[1] as f32;
+                        resvg::render(tree, usvg::Transform::from_scale(sx, sy), &mut pixmap.as_mut());
                         let image = egui::ColorImage::from_rgba_unmultiplied(
-                            [render_width as usize, render_height as usize],
+                            [target_w as usize, target_h as usize],
                             pixmap.data(),
                         );
                         *texture = ctx.load_texture("svg_texture", image, Default::default());
                         *last_scale = self.scale;
+                        info!(
+                            "SVG再レンダリング: {}x{} (scale: {:.3}, ppp: {})",
+                            target_w, target_h, self.scale, ppp
+                        );
                     }
                 }
             }
@@ -750,11 +792,17 @@ impl ImageViewer {
 
             if let Some(image) = &self.current_image {
                 let rect_size = available_rect.size();
-                let texture_size = match image {
-                    LoadedImage::Raster { texture, .. } => texture.size_vec2(),
-                    LoadedImage::Svg { texture, .. } => texture.size_vec2(),
+                // 表示サイズ（論理ポイント）。
+                // ラスタは「元ピクセル数 × 拡大率」。
+                // SVG はテクスチャを表示解像度ぴったりに焼き直しているので、
+                // 「元SVGサイズ × 拡大率」をそのまま表示サイズにすると 1:1 で鮮明に出る
+                // （以前は texture_size × scale としていたため scale が二重に掛かっていた）。
+                let scaled_size = match image {
+                    LoadedImage::Raster { texture, .. } => texture.size_vec2() * self.scale,
+                    LoadedImage::Svg { original_size, .. } => {
+                        egui::vec2(original_size[0] as f32, original_size[1] as f32) * self.scale
+                    }
                 };
-                let scaled_size = texture_size * self.scale;
                 let pos = available_rect.min + (rect_size - scaled_size) * 0.5 + self.pan_offset;
                 let rect = Rect::from_min_size(pos, scaled_size);
                 ui.put(
