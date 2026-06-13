@@ -597,7 +597,7 @@ impl ImageViewer {
                                     let path = entry.path();
                                     if path.extension().map_or(false, |ext| {
                                         let ext = ext.to_string_lossy().to_lowercase();
-                                        ["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg"]
+                                        ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"]
                                             .contains(&ext.as_str())
                                     }) {
                                         Some(path)
@@ -680,7 +680,7 @@ impl ImageViewer {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open").clicked() {
                         if let Some(file_path) = rfd::FileDialog::new()
-                            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "bmp", "svg"])
+                            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"])
                             .pick_file()
                         {
                             self.load_image(&file_path, ctx);
@@ -829,7 +829,7 @@ impl ImageViewer {
                     self.scale = 1.0;
                 } else if ui.input(|i| i.key_pressed(Key::O)) {
                     if let Some(file_path) = rfd::FileDialog::new()
-                        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "bmp", "svg", "heic", "heif"])
+                        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"])
                         .pick_file()
                     {
                         self.load_image(&file_path, ctx);
