@@ -537,7 +537,18 @@ impl ImageViewer {
     }
 
     fn load_raster(&mut self, path: &Path, ctx: &egui::Context) -> bool {
-        match image::open(path) {
+        // HEIC/HEIF は image クレートが非対応なので、Windows の WIC（OS の HEIF コーデック）で
+        // デコードする。それ以外は従来どおり image クレートで読み込む。
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let decoded: Result<image::DynamicImage, String> = if ext == "heic" || ext == "heif" {
+            decode_heic_wic(path)
+        } else {
+            image::open(path).map_err(|e| e.to_string())
+        };
+        match decoded {
             Ok(mut image) => {
                 // GPU の最大テクスチャ辺を超える画像はそのまま load_texture するとパニックするため、
                 // アスペクト比を保ったまま収まるよう縮小する（通常サイズの画像には影響しない）。
@@ -597,7 +608,7 @@ impl ImageViewer {
                                     let path = entry.path();
                                     if path.extension().map_or(false, |ext| {
                                         let ext = ext.to_string_lossy().to_lowercase();
-                                        ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"]
+                                        ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "heif"]
                                             .contains(&ext.as_str())
                                     }) {
                                         Some(path)
@@ -680,7 +691,7 @@ impl ImageViewer {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open").clicked() {
                         if let Some(file_path) = rfd::FileDialog::new()
-                            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"])
+                            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "heif"])
                             .pick_file()
                         {
                             self.load_image(&file_path, ctx);
@@ -829,7 +840,7 @@ impl ImageViewer {
                     self.scale = 1.0;
                 } else if ui.input(|i| i.key_pressed(Key::O)) {
                     if let Some(file_path) = rfd::FileDialog::new()
-                        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"])
+                        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "heif"])
                         .pick_file()
                     {
                         self.load_image(&file_path, ctx);
@@ -949,6 +960,94 @@ impl eframe::App for ImageViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update(ctx);
     }
+}
+
+/// HEIC/HEIF を Windows の WIC（OS が持つ HEIF/HEVC コーデック）でデコードして RGBA 画像を返す。
+/// 実行には「HEIF Image Extensions」（Microsoft Store で無料）が必要。未導入だとデコード時にエラー。
+#[cfg(windows)]
+fn decode_heic_wic(path: &Path) -> Result<image::DynamicImage, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::GENERIC_READ;
+    use windows::Win32::Graphics::Imaging::{
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, IWICImagingFactory,
+        WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
+    };
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        // winit が COM を初期化済みのはずだが念のため。初期化済み／モード差異のエラーは無視。
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
+                .map_err(|e| format!("WIC ファクトリの生成に失敗: {e}"))?;
+
+        let decoder = factory
+            .CreateDecoderFromFilename(
+                PCWSTR(wide.as_ptr()),
+                None,
+                GENERIC_READ,
+                WICDecodeMetadataCacheOnDemand,
+            )
+            .map_err(|e| {
+                format!("HEIC をデコードできません（HEIF Image Extensions 未導入の可能性）: {e}")
+            })?;
+
+        let frame = decoder
+            .GetFrame(0)
+            .map_err(|e| format!("フレーム取得に失敗: {e}"))?;
+
+        // どのピクセル形式の HEIC でも 32bpp RGBA に変換してから取り出す。
+        let converter = factory
+            .CreateFormatConverter()
+            .map_err(|e| format!("フォーマット変換器の生成に失敗: {e}"))?;
+        converter
+            .Initialize(
+                &frame,
+                &GUID_WICPixelFormat32bppRGBA,
+                WICBitmapDitherTypeNone,
+                None,
+                0.0,
+                WICBitmapPaletteTypeCustom,
+            )
+            .map_err(|e| format!("RGBA への変換に失敗: {e}"))?;
+
+        let mut w: u32 = 0;
+        let mut h: u32 = 0;
+        converter
+            .GetSize(&mut w, &mut h)
+            .map_err(|e| format!("画像サイズの取得に失敗: {e}"))?;
+        if w == 0 || h == 0 {
+            return Err("画像サイズが不正です".into());
+        }
+
+        let stride = w.checked_mul(4).ok_or("画像が大きすぎます")?;
+        let buf_len = (stride as usize)
+            .checked_mul(h as usize)
+            .ok_or("画像が大きすぎます")?;
+        let mut buf = vec![0u8; buf_len];
+        converter
+            .CopyPixels(std::ptr::null(), stride, &mut buf)
+            .map_err(|e| format!("ピクセルの取得に失敗: {e}"))?;
+
+        let img = image::RgbaImage::from_raw(w, h, buf).ok_or("バッファサイズが不一致")?;
+        Ok(image::DynamicImage::ImageRgba8(img))
+    }
+}
+
+/// 非 Windows では HEIC 非対応（このアプリは Windows 専用だが、cfg を明示しておく）。
+#[cfg(not(windows))]
+fn decode_heic_wic(_path: &Path) -> Result<image::DynamicImage, String> {
+    Err("HEIC は Windows でのみ対応しています".into())
 }
 
 fn create_fallback_icon() -> IconData {
