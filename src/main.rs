@@ -21,6 +21,15 @@ use resvg;
 use rfd;
 use image;
 
+/// 対応する画像拡張子。image クレートでデコードできるもの（png/jpg/gif/webp/bmp/tiff/ico/tga/
+/// dds/exr/hdr/qoi/pnm 系）に加え、WIC フォールバックで開ける形式（heic/heif/avif/jxr 等）と svg。
+/// File ダイアログのフィルタとフォルダ送りの判定で共通利用する。
+const SUPPORTED_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "jfif", "gif", "webp", "bmp", "dib", "svg", "heic", "heif", "avif", "tif",
+    "tiff", "ico", "tga", "dds", "exr", "hdr", "qoi", "pnm", "ppm", "pgm", "pbm", "pam", "ff",
+    "farbfeld", "jxr", "wdp",
+];
+
 /// 設定ファイル（TOML）の内容
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ViewerConfig {
@@ -537,16 +546,23 @@ impl ImageViewer {
     }
 
     fn load_raster(&mut self, path: &Path, ctx: &egui::Context) -> bool {
-        // HEIC/HEIF は image クレートが非対応なので、Windows の WIC（OS の HEIF コーデック）で
-        // デコードする。それ以外は従来どおり image クレートで読み込む。
+        // まず image クレートで読む（png/jpg/gif/webp/bmp/tiff/ico/tga/dds/exr/hdr/qoi/pnm 等を網羅）。
+        // image が非対応の形式（HEIC/HEIF/AVIF/JPEG XR/カメラRAW 等）は、Windows の WIC
+        // （OS が持つ画像コーデック＋ストアの拡張機能）にフォールバックして可能な限り開く。
         let ext = path
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
         let decoded: Result<image::DynamicImage, String> = if ext == "heic" || ext == "heif" {
-            decode_heic_wic(path)
+            decode_via_wic(path) // image は HEIC 非対応なので最初から WIC
         } else {
-            image::open(path).map_err(|e| e.to_string())
+            match image::open(path) {
+                Ok(img) => Ok(img),
+                Err(e) => {
+                    info!("image で読めず WIC にフォールバック: {} ({})", path.display(), e);
+                    decode_via_wic(path).map_err(|werr| format!("{e} / WIC: {werr}"))
+                }
+            }
         };
         match decoded {
             Ok(mut image) => {
@@ -608,8 +624,7 @@ impl ImageViewer {
                                     let path = entry.path();
                                     if path.extension().map_or(false, |ext| {
                                         let ext = ext.to_string_lossy().to_lowercase();
-                                        ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "heif"]
-                                            .contains(&ext.as_str())
+                                        SUPPORTED_EXTS.contains(&ext.as_str())
                                     }) {
                                         Some(path)
                                     } else {
@@ -691,7 +706,8 @@ impl ImageViewer {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open").clicked() {
                         if let Some(file_path) = rfd::FileDialog::new()
-                            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "heif"])
+                            .add_filter("Images", SUPPORTED_EXTS)
+                            .add_filter("All Files", &["*"])
                             .pick_file()
                         {
                             self.load_image(&file_path, ctx);
@@ -840,7 +856,8 @@ impl ImageViewer {
                     self.scale = 1.0;
                 } else if ui.input(|i| i.key_pressed(Key::O)) {
                     if let Some(file_path) = rfd::FileDialog::new()
-                        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "heif"])
+                        .add_filter("Images", SUPPORTED_EXTS)
+                        .add_filter("All Files", &["*"])
                         .pick_file()
                     {
                         self.load_image(&file_path, ctx);
@@ -962,10 +979,11 @@ impl eframe::App for ImageViewer {
     }
 }
 
-/// HEIC/HEIF を Windows の WIC（OS が持つ HEIF/HEVC コーデック）でデコードして RGBA 画像を返す。
-/// 実行には「HEIF Image Extensions」（Microsoft Store で無料）が必要。未導入だとデコード時にエラー。
+/// 画像を Windows の WIC（OS が持つ画像コーデック）でデコードして RGBA 画像を返す。
+/// image クレートが非対応の形式（HEIC/HEIF/AVIF/JPEG XR/カメラRAW 等）のフォールバックに使う。
+/// 形式によっては Microsoft Store の拡張機能（例: HEIF 画像拡張機能 / AV1 ビデオ拡張機能）が必要。
 #[cfg(windows)]
-fn decode_heic_wic(path: &Path) -> Result<image::DynamicImage, String> {
+fn decode_via_wic(path: &Path) -> Result<image::DynamicImage, String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::GENERIC_READ;
@@ -999,7 +1017,7 @@ fn decode_heic_wic(path: &Path) -> Result<image::DynamicImage, String> {
                 WICDecodeMetadataCacheOnDemand,
             )
             .map_err(|e| {
-                format!("HEIC をデコードできません（HEIF Image Extensions 未導入の可能性）: {e}")
+                format!("この形式をデコードできません（対応コーデック/拡張機能が未導入の可能性）: {e}")
             })?;
 
         let frame = decoder
@@ -1044,10 +1062,10 @@ fn decode_heic_wic(path: &Path) -> Result<image::DynamicImage, String> {
     }
 }
 
-/// 非 Windows では HEIC 非対応（このアプリは Windows 専用だが、cfg を明示しておく）。
+/// 非 Windows では WIC フォールバック非対応（このアプリは Windows 専用だが、cfg を明示しておく）。
 #[cfg(not(windows))]
-fn decode_heic_wic(_path: &Path) -> Result<image::DynamicImage, String> {
-    Err("HEIC は Windows でのみ対応しています".into())
+fn decode_via_wic(_path: &Path) -> Result<image::DynamicImage, String> {
+    Err("この形式は Windows でのみ対応しています".into())
 }
 
 fn create_fallback_icon() -> IconData {
