@@ -279,6 +279,68 @@ struct SvgRenderResult {
     image: egui::ColorImage,
 }
 
+/// 木のすべてのグループが「合成に影響する属性を持たない」か確認する。
+/// true なら、子ノードを個別に（間のグループを無視して）描画しても結果が変わらないため、
+/// 視野外ノードのカリングが安全にできる。opacity/フィルタ/マスク/クリップ/ブレンドの
+/// いずれかを持つグループがあれば false（従来どおり木全体を描画する）。
+fn tree_is_flat(group: &usvg::Group) -> bool {
+    group.children().iter().all(|node| match node {
+        usvg::Node::Group(g) => {
+            g.opacity().get() == 1.0
+                && g.blend_mode() == usvg::BlendMode::Normal
+                && g.clip_path().is_none()
+                && g.mask().is_none()
+                && g.filters().is_empty()
+                && !g.isolate()
+                && tree_is_flat(g)
+        }
+        _ => true,
+    })
+}
+
+/// 可視範囲（SVG絶対ユーザー座標）と交差するノードだけを描画する（ビューポートカリング）。
+/// resvg::render は毎回すべての要素を処理し、しかもストロークの輪郭生成コストは
+/// ズーム倍率に比例して増えるため、拡大するほど遅くなる。ここで視野外の要素を
+/// バウンディングボックス判定で描画前に間引くことで、拡大時ほど軽くする。
+/// tree_is_flat() が true の木でのみ正しい結果になる。
+fn render_culled(
+    group: &usvg::Group,
+    clip: tiny_skia::Rect,
+    ts: usvg::Transform,
+    pixmap: &mut tiny_skia::PixmapMut,
+    drawn: &mut u32,
+    culled: &mut u32,
+) {
+    for node in group.children() {
+        let bbox = node.abs_stroke_bounding_box();
+        let visible = bbox.left() < clip.right()
+            && bbox.right() > clip.left()
+            && bbox.top() < clip.bottom()
+            && bbox.bottom() > clip.top();
+        if !visible {
+            *culled += 1;
+            continue;
+        }
+        match node {
+            usvg::Node::Group(g) => render_culled(g, clip, ts, pixmap, drawn, culled),
+            _ => {
+                // resvg::render_node は「ノードを自身の bbox 原点へ平行移動して描く」
+                // 単体描画用の API で、祖先グループの変換も適用しない。
+                // その平行移動を打ち消し（pre_translate で相殺）、祖先の変換
+                // （abs_transform）を合成することで、resvg::render による
+                // ツリー全体描画とまったく同じ位置・見た目で描く。
+                if let Some(layer_bbox) = node.abs_layer_bounding_box() {
+                    let p = ts
+                        .pre_concat(node.abs_transform())
+                        .pre_translate(layer_bbox.x(), layer_bbox.y());
+                    resvg::render_node(node, p, pixmap);
+                    *drawn += 1;
+                }
+            }
+        }
+    }
+}
+
 /// SVG ラスタライズ用のワーカースレッドを起動する。
 /// 精密な SVG は 1 回のラスタライズに時間がかかるため UI スレッドでは行わず、
 /// ここで処理する。チャンネルに溜まった要求は最新の 1 件だけを処理する
@@ -291,6 +353,16 @@ fn spawn_svg_render_worker(
     let (job_tx, job_rx) = mpsc::channel::<SvgRenderJob>();
     let (result_tx, result_rx) = mpsc::channel::<SvgRenderResult>();
     std::thread::spawn(move || {
+        // フラットな木（グループ効果なし）なら視野外カリングが安全に使える
+        let flat = tree_is_flat(tree.root());
+        info!(
+            "SVG構造解析: {}",
+            if flat {
+                "フラット — 視野外カリング有効（拡大時ほど軽くなる）"
+            } else {
+                "グループ効果あり — 全体描画にフォールバック"
+            }
+        );
         while let Ok(mut job) = job_rx.recv() {
             // 最新の要求だけを残す
             while let Ok(newer) = job_rx.try_recv() {
@@ -306,13 +378,29 @@ fn spawn_svg_render_worker(
             // SVG座標 → crop 内 px。回転は描画時の UV で表現するため含めない
             let ts = usvg::Transform::from_scale(job.scale_px, job.scale_px)
                 .post_translate(-job.svg_crop[0], -job.svg_crop[1]);
-            resvg::render(&tree, ts, &mut pixmap.as_mut());
+            // 可視範囲をユーザー座標へ戻し、AA のにじみ分だけ少し広げる
+            let pad = 2.0 / job.scale_px.max(f32::EPSILON);
+            let clip = tiny_skia::Rect::from_xywh(
+                job.svg_crop[0] / job.scale_px - pad,
+                job.svg_crop[1] / job.scale_px - pad,
+                job.svg_crop[2] / job.scale_px + pad * 2.0,
+                job.svg_crop[3] / job.scale_px + pad * 2.0,
+            );
+            let (mut drawn, mut culled) = (0u32, 0u32);
+            match (flat, clip) {
+                (true, Some(clip)) => {
+                    render_culled(tree.root(), clip, ts, &mut pixmap.as_mut(), &mut drawn, &mut culled)
+                }
+                _ => resvg::render(&tree, ts, &mut pixmap.as_mut()),
+            }
             debug!(
-                "SVGレンダリング: {}x{} scale_px={:.2} ({} ms)",
+                "SVGレンダリング: {}x{} scale_px={:.2} ({} ms, 描画 {} / カリング {})",
                 pw,
                 ph,
                 job.scale_px,
-                started.elapsed().as_millis()
+                started.elapsed().as_millis(),
+                drawn,
+                culled
             );
             // tiny-skia の出力は premultiplied RGBA なのでそのまま渡す
             let image = egui::ColorImage::from_rgba_premultiplied(
@@ -2030,6 +2118,170 @@ mod tests {
             opaque_pixels_in_band(&pixmap, 0, 60) > 100,
             "埋め込みフォントのテキストが描画されていない"
         );
+    }
+
+    #[test]
+    fn tree_is_flat_detects_group_effects() {
+        let opt = Options::default();
+        let flat = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+            <g transform="translate(10,10)"><circle cx="10" cy="10" r="5" fill="red"/></g>
+            <rect x="50" y="50" width="20" height="20" fill="blue"/>
+        </svg>"#;
+        let tree = Tree::from_str(flat, &opt).unwrap();
+        assert!(tree_is_flat(tree.root()), "transform だけのグループはフラット扱いのはず");
+
+        let not_flat = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+            <g opacity="0.5"><circle cx="10" cy="10" r="5" fill="red"/></g>
+        </svg>"#;
+        let tree = Tree::from_str(not_flat, &opt).unwrap();
+        assert!(!tree_is_flat(tree.root()), "opacity 付きグループはフラットではない");
+    }
+
+    /// カリング描画が全体描画と同じ絵を出すこと（クロップ領域をピクセル比較）
+    #[test]
+    fn culled_render_matches_full_render() {
+        let opt = Options::default();
+        // 円・矩形・線を散らしたフラットな SVG（クロップ境界をまたぐ要素も含む）
+        let mut svg = String::from(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400">"#,
+        );
+        let mut seed = 12345u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) % 400) as f32
+        };
+        for _ in 0..300 {
+            let (x, y, r) = (next(), next(), 3.0 + next() % 20.0);
+            svg.push_str(&format!(
+                r##"<circle cx="{x}" cy="{y}" r="{r}" fill="none" stroke="#c33" stroke-width="1.5"/>"##
+            ));
+        }
+        for _ in 0..100 {
+            let (x, y) = (next(), next());
+            svg.push_str(&format!(
+                r##"<rect x="{x}" y="{y}" width="30" height="18" fill="#356"/>"##
+            ));
+        }
+        // 祖先グループの変換が正しく合成されることも検証する（入れ子 transform）
+        svg.push_str(
+            r##"<g transform="translate(40,20)"><g transform="scale(1.5)">
+                <circle cx="60" cy="70" r="25" fill="none" stroke="#181" stroke-width="2"/>
+                <rect x="30" y="90" width="40" height="22" fill="#815"/>
+            </g></g>"##,
+        );
+        svg.push_str("</svg>");
+        let tree = Tree::from_str(&svg, &opt).unwrap();
+        assert!(tree_is_flat(tree.root()));
+
+        // 同一クロップ [x=100, y=120, w=200, h=180]（物理px）を
+        // 「木全体の描画」と「カリング描画」の両方で描いて比較する。
+        // （ピクスマップ境界1px のAA近似はクロップ描画自体の性質で両者共通なので、
+        //  この比較ならカリングによる差だけが検出できる）
+        let scale = 2.0f32;
+        let (cx, cy, cw, ch) = (100u32, 120u32, 200u32, 180u32);
+        let ts = usvg::Transform::from_scale(scale, scale)
+            .post_translate(-(cx as f32), -(cy as f32));
+        let mut full = Pixmap::new(cw, ch).unwrap();
+        resvg::render(&tree, ts, &mut full.as_mut());
+
+        let mut part = Pixmap::new(cw, ch).unwrap();
+        let pad = 2.0 / scale;
+        let clip = tiny_skia::Rect::from_xywh(
+            cx as f32 / scale - pad,
+            cy as f32 / scale - pad,
+            cw as f32 / scale + pad * 2.0,
+            ch as f32 / scale + pad * 2.0,
+        )
+        .unwrap();
+        let (mut drawn, mut culled) = (0u32, 0u32);
+        render_culled(tree.root(), clip, ts, &mut part.as_mut(), &mut drawn, &mut culled);
+        assert!(drawn > 0, "何も描画されていない");
+        assert!(culled > 0, "何もカリングされていない（テストの意味がない）");
+
+        // ピクセル比較（浮動小数の丸め差を考慮し、チャンネル差 1 まで許容）
+        let mut mismatches = 0usize;
+        let mut max_diff = 0u8;
+        let mut samples: Vec<(u32, u32, [u8; 4], [u8; 4])> = Vec::new();
+        for y in 0..ch {
+            for x in 0..cw {
+                let a = part.pixel(x, y).unwrap();
+                let b = full.pixel(x, y).unwrap();
+                let d = a
+                    .red()
+                    .abs_diff(b.red())
+                    .max(a.green().abs_diff(b.green()))
+                    .max(a.blue().abs_diff(b.blue()))
+                    .max(a.alpha().abs_diff(b.alpha()));
+                if d > 1 {
+                    mismatches += 1;
+                    max_diff = max_diff.max(d);
+                    if samples.len() < 8 {
+                        samples.push((
+                            x,
+                            y,
+                            [a.red(), a.green(), a.blue(), a.alpha()],
+                            [b.red(), b.green(), b.blue(), b.alpha()],
+                        ));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "カリング描画と全体描画の絵が一致しない（{drawn} 描画 / {culled} カリング, 最大差 {max_diff}, 例 {samples:?}）"
+        );
+    }
+
+    /// 性能計測（cargo test --release perf_culled -- --ignored --nocapture で実行）
+    #[test]
+    #[ignore]
+    fn perf_culled_zoom_vs_full() {
+        let opt = Options::default();
+        let mut svg = String::from(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="2000">"#,
+        );
+        let mut seed = 42u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) % 2000) as f32
+        };
+        for _ in 0..40000 {
+            let (x, y, r) = (next(), next(), 2.0 + next() % 12.0);
+            svg.push_str(&format!(
+                r##"<circle cx="{x}" cy="{y}" r="{r}" fill="none" stroke="#357" stroke-width="0.6"/>"##
+            ));
+        }
+        svg.push_str("</svg>");
+        let tree = Tree::from_str(&svg, &opt).unwrap();
+        assert!(tree_is_flat(tree.root()));
+
+        // 拡大 20 倍で 1000x1000 の可視領域（画面相当）を描く
+        let scale = 20.0f32;
+        let (cx, cy, cw, ch) = (15000.0f32, 15000.0f32, 1000u32, 1000u32);
+        let ts = usvg::Transform::from_scale(scale, scale).post_translate(-cx, -cy);
+        let clip = tiny_skia::Rect::from_xywh(
+            cx / scale,
+            cy / scale,
+            cw as f32 / scale,
+            ch as f32 / scale,
+        )
+        .unwrap();
+
+        let mut p1 = Pixmap::new(cw, ch).unwrap();
+        let t0 = std::time::Instant::now();
+        resvg::render(&tree, ts, &mut p1.as_mut());
+        let full_ms = t0.elapsed().as_millis();
+
+        let mut p2 = Pixmap::new(cw, ch).unwrap();
+        let (mut drawn, mut culled) = (0u32, 0u32);
+        let t1 = std::time::Instant::now();
+        render_culled(tree.root(), clip, ts, &mut p2.as_mut(), &mut drawn, &mut culled);
+        let culled_ms = t1.elapsed().as_millis();
+
+        println!(
+            "拡大20倍 1000x1000: 全体描画 {full_ms} ms / カリング描画 {culled_ms} ms（描画 {drawn}, カリング {culled}）"
+        );
+        assert!(culled_ms <= full_ms, "カリングが逆効果になっている");
     }
 
     #[test]
