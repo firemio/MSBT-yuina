@@ -216,6 +216,32 @@ mod tests {
         );
     }
 
+    /// 実際のリリースアセットをダウンロード経路（リダイレクト含む）で取得できるか
+    /// （cargo test -- --ignored で実行。self_replace は行わない）
+    #[test]
+    #[ignore]
+    fn live_download_latest_asset() {
+        let rel = fetch_latest_release().expect("GitHub API から取得できない");
+        let asset = rel
+            .assets
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(ASSET_NAME))
+            .expect("アセットが無い");
+        let resp = ureq::get(&asset.browser_download_url)
+            .set("User-Agent", &user_agent())
+            .timeout(Duration::from_secs(600))
+            .call()
+            .expect("ダウンロード開始に失敗");
+        let mut data = Vec::new();
+        resp.into_reader()
+            .take(200 * 1024 * 1024)
+            .read_to_end(&mut data)
+            .expect("ダウンロードに失敗");
+        println!("downloaded {} bytes", data.len());
+        assert!(data.len() > 1024 * 1024, "サイズが小さすぎる: {}", data.len());
+        assert!(data.starts_with(b"MZ"), "PE 実行ファイルではない");
+    }
+
     #[test]
     fn version_parsing() {
         assert_eq!(parse_version("v1.2.3"), vec![1, 2, 3]);
