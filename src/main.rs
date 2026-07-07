@@ -4,7 +4,7 @@ use eframe::egui::{self, Color32, Key, Pos2, Rect, Vec2};
 use egui::IconData;
 use ico;
 use image;
-use log::{error, info, LevelFilter};
+use log::{debug, error, info, LevelFilter};
 use log4rs::{
     append::file::FileAppender,
     config::{Appender, Config, Root},
@@ -18,6 +18,7 @@ use std::fs;
 use std::io::Cursor;
 use std::panic;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::Arc;
 use tiny_skia::Pixmap;
 use usvg::{Options, Tree};
@@ -253,6 +254,7 @@ fn create_app_options() -> Result<eframe::NativeOptions, Box<dyn std::error::Err
 
 /// SVG テクスチャが現在保持している描画領域。
 /// crop は「回転適用後の表示空間」における物理 px の矩形 [x, y, w, h]（画像原点基準）。
+#[derive(Clone, Copy, PartialEq)]
 struct SvgView {
     /// SVG のユーザー単位 → 物理 px の倍率（表示倍率 × pixels_per_point）
     scale_px: f32,
@@ -261,22 +263,101 @@ struct SvgView {
     crop: [u32; 4],
 }
 
+/// バックグラウンドワーカーへの SVG ラスタライズ要求
+struct SvgRenderJob {
+    scale_px: f32,
+    rot: u8,
+    /// 表示空間（回転後）の crop [x,y,w,h]（物理px）
+    crop: [u32; 4],
+    /// SVG 空間の crop（レンダリングに使う矩形）
+    svg_crop: [f32; 4],
+}
+
+/// ワーカーからのラスタライズ結果
+struct SvgRenderResult {
+    view: SvgView,
+    image: egui::ColorImage,
+}
+
+/// SVG ラスタライズ用のワーカースレッドを起動する。
+/// 精密な SVG は 1 回のラスタライズに時間がかかるため UI スレッドでは行わず、
+/// ここで処理する。チャンネルに溜まった要求は最新の 1 件だけを処理する
+/// （連続ズーム中の中間状態は描いても無駄になるので捨てる）。
+/// 送信側（LoadedImage::Svg）が破棄されるとスレッドは自動終了する。
+fn spawn_svg_render_worker(
+    tree: Tree,
+    ctx: egui::Context,
+) -> (mpsc::Sender<SvgRenderJob>, mpsc::Receiver<SvgRenderResult>) {
+    let (job_tx, job_rx) = mpsc::channel::<SvgRenderJob>();
+    let (result_tx, result_rx) = mpsc::channel::<SvgRenderResult>();
+    std::thread::spawn(move || {
+        while let Ok(mut job) = job_rx.recv() {
+            // 最新の要求だけを残す
+            while let Ok(newer) = job_rx.try_recv() {
+                job = newer;
+            }
+            let pw = job.svg_crop[2].round().max(1.0) as u32;
+            let ph = job.svg_crop[3].round().max(1.0) as u32;
+            let Some(mut pixmap) = Pixmap::new(pw, ph) else {
+                error!("SVGレンダリング用のバッファを確保できません: {}x{}", pw, ph);
+                continue;
+            };
+            let started = std::time::Instant::now();
+            // SVG座標 → crop 内 px。回転は描画時の UV で表現するため含めない
+            let ts = usvg::Transform::from_scale(job.scale_px, job.scale_px)
+                .post_translate(-job.svg_crop[0], -job.svg_crop[1]);
+            resvg::render(&tree, ts, &mut pixmap.as_mut());
+            debug!(
+                "SVGレンダリング: {}x{} scale_px={:.2} ({} ms)",
+                pw,
+                ph,
+                job.scale_px,
+                started.elapsed().as_millis()
+            );
+            // tiny-skia の出力は premultiplied RGBA なのでそのまま渡す
+            let image = egui::ColorImage::from_rgba_premultiplied(
+                [pw as usize, ph as usize],
+                pixmap.data(),
+            );
+            let result = SvgRenderResult {
+                view: SvgView {
+                    scale_px: job.scale_px,
+                    rot: job.rot,
+                    crop: job.crop,
+                },
+                image,
+            };
+            if result_tx.send(result).is_err() {
+                break; // 受信側が破棄済み（画像が切り替わった）
+            }
+            ctx.request_repaint();
+        }
+    });
+    (job_tx, result_rx)
+}
+
 /// 読み込んだ画像の種類を表す型
 /// Raster: 通常画像
-/// Svg: usvg::Tree を保持し、表示のたびに可視領域だけを表示解像度でラスタライズする
+/// Svg: 専用ワーカースレッドが可視領域だけを表示解像度でラスタライズする。
+///      UI スレッドは要求を送り、完成までは手持ちのテクスチャを引き伸ばして表示する
 enum LoadedImage {
     Raster {
         texture: egui::TextureHandle,
         path: PathBuf,
     },
     Svg {
-        tree: Tree,
         /// SVG 本来のサイズ（ユーザー単位 ＝ 等倍時の論理 px）
         size: [f32; 2],
-        /// 直近にラスタライズした可視領域のテクスチャ（初回描画時に生成）
+        /// 直近にラスタライズされた可視領域のテクスチャ（初回結果の到着時に生成）
         texture: Option<egui::TextureHandle>,
         /// texture が保持している領域の情報
         view: Option<SvgView>,
+        /// ラスタライズ要求の送信先（ワーカースレッド）
+        job_tx: mpsc::Sender<SvgRenderJob>,
+        /// ラスタライズ結果の受信元
+        result_rx: mpsc::Receiver<SvgRenderResult>,
+        /// 直近にワーカーへ依頼した内容（同一要求の重複送信を防ぐ）
+        last_requested: Option<SvgView>,
         path: PathBuf,
     },
 }
@@ -795,7 +876,7 @@ impl ImageViewer {
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
         let result = if ext == "svg" || ext == "svgz" {
-            self.load_svg(path)
+            self.load_svg(path, ctx)
         } else {
             // 拡張子が不明でも WIC フォールバック込みでラスタとして試す
             self.load_raster(path, ctx)
@@ -814,8 +895,8 @@ impl ImageViewer {
         result
     }
 
-    fn load_svg(&mut self, path: &Path) -> bool {
-        match self.try_load_svg(path) {
+    fn load_svg(&mut self, path: &Path, ctx: &egui::Context) -> bool {
+        match self.try_load_svg(path, ctx) {
             Ok(()) => true,
             Err(message) => {
                 error!("{}", message);
@@ -828,7 +909,7 @@ impl ImageViewer {
         }
     }
 
-    fn try_load_svg(&mut self, path: &Path) -> Result<(), String> {
+    fn try_load_svg(&mut self, path: &Path, ctx: &egui::Context) -> Result<(), String> {
         let raw = fs::read(path)
             .map_err(|e| format!("SVGファイルの読み込みに失敗しました: {} - {}", path.display(), e))?;
         // .svgz（gzip 圧縮 SVG）対応
@@ -871,12 +952,16 @@ impl ImageViewer {
         let (w, h) = (size.width(), size.height());
         info!("SVGサイズ: {}x{}", w, h);
         self.image_size = Some([w.ceil() as u32, h.ceil() as u32]);
-        // テクスチャは生成しない。描画時に可視領域だけを表示解像度でラスタライズする。
+        // Tree はワーカースレッドへ移動し、以後のラスタライズはすべてそちらで行う。
+        // 前の画像のワーカーは、旧 LoadedImage が破棄されて送信側が閉じると自動終了する。
+        let (job_tx, result_rx) = spawn_svg_render_worker(tree, ctx.clone());
         self.current_image = Some(LoadedImage::Svg {
-            tree,
             size: [w, h],
             texture: None,
             view: None,
+            job_tx,
+            result_rx,
+            last_requested: None,
             path: path.to_path_buf(),
         });
         info!("SVGの読み込みが完了しました");
@@ -1418,11 +1503,40 @@ impl ImageViewer {
                         LoadedImage::Raster { texture, .. } => {
                             draw_texture_rotated(ui.painter(), texture, image_rect, rotation);
                         }
-                        LoadedImage::Svg { tree, size, texture, view, .. } => {
-                            // SVG はベクターなので、1枚のテクスチャを引き伸ばすと拡大時にボケる。
-                            // 可視領域（＋余白）だけを表示解像度ちょうどでラスタライズし直すことで、
-                            // どんな拡大率でも常に 1px=1texel の鮮明さを保つ。テクスチャはおおむね
-                            // 画面サイズ程度で済むため、高倍率でも巨大テクスチャを作らない。
+                        LoadedImage::Svg {
+                            size,
+                            texture,
+                            view,
+                            job_tx,
+                            result_rx,
+                            last_requested,
+                            ..
+                        } => {
+                            // SVG はベクターなので、可視領域（＋余白）だけを表示解像度ちょうどで
+                            // ラスタライズする（どんな拡大率でも 1px=1texel の鮮明さ）。
+                            // ラスタライズはワーカースレッドで行い、UI はブロックしない。
+                            // 完成までは手持ちのテクスチャを引き伸ばして表示する
+                            // （精密な SVG ではズーム中に一瞬ぼやけ、止まると鮮明になる）。
+
+                            // ワーカーからの完成テクスチャを受け取る（最後の 1 件だけ反映すれば十分）
+                            let mut arrived: Option<SvgRenderResult> = None;
+                            while let Ok(res) = result_rx.try_recv() {
+                                arrived = Some(res);
+                            }
+                            if let Some(res) = arrived {
+                                match texture.as_mut() {
+                                    Some(t) => t.set(res.image, egui::TextureOptions::LINEAR),
+                                    None => {
+                                        *texture = Some(ctx.load_texture(
+                                            "svg_view",
+                                            res.image,
+                                            egui::TextureOptions::LINEAR,
+                                        ))
+                                    }
+                                }
+                                *view = Some(res.view);
+                            }
+
                             let scale_px = scale * ppp;
                             let visible = image_rect.intersect(panel_rect);
                             if visible.is_positive() && scale_px > 0.0 {
@@ -1443,69 +1557,88 @@ impl ImageViewer {
                                     .ceil()
                                     .clamp(0.0, full_h_px);
 
-                                // このフレームで描くべき crop（入力から決定的に計算される）
+                                // このフレームで必要な crop（入力から決定的に計算される）
                                 let (tx, tw) =
                                     crop_axis(nx0, nx1, full_w_px, SVG_RENDER_MARGIN_PX, max_dim);
                                 let (ty, th) =
                                     crop_axis(ny0, ny1, full_h_px, SVG_RENDER_MARGIN_PX, max_dim);
-                                let target = [tx, ty, tw, th];
+                                let target = SvgView {
+                                    scale_px,
+                                    rot: rotation,
+                                    crop: [tx, ty, tw, th],
+                                };
 
-                                // 直近の結果が必要領域を丸ごと含む（パン余白内）か、いま計算した
-                                // crop と一致するなら再利用。後者は可視領域が GPU 上限を超えて
-                                // 全体を含められない場合に、ビューが動かない限り再描画しないための条件。
-                                let cached = texture.is_some()
+                                // いまのテクスチャで十分か: スケール・回転が一致し、必要領域を
+                                // 丸ごと含む（パン余白内）か、必要 crop と一致（可視領域が GPU 上限を
+                                // 超えるケース）していれば追加のラスタライズは不要。
+                                let satisfied = texture.is_some()
                                     && view.as_ref().map_or(false, |v| {
                                         v.rot == rotation
                                             && (v.scale_px - scale_px).abs() <= scale_px * 1e-4
-                                            && (v.crop == target
+                                            && (v.crop == target.crop
                                                 || (v.crop[0] as f32 <= nx0
                                                     && v.crop[1] as f32 <= ny0
                                                     && (v.crop[0] + v.crop[2]) as f32 >= nx1
                                                     && (v.crop[1] + v.crop[3]) as f32 >= ny1))
                                     });
 
-                                if !cached {
-                                    let crop = target;
-                                    // 表示空間（回転後）の crop を SVG 空間の矩形へ写像
+                                // 足りなければワーカーに依頼（同一要求の重複送信はしない）
+                                if !satisfied && *last_requested != Some(target) {
                                     let svg_crop = map_display_crop_to_svg(
                                         rotation,
                                         size[0] * scale_px,
                                         size[1] * scale_px,
-                                        [crop[0] as f32, crop[1] as f32, crop[2] as f32, crop[3] as f32],
+                                        [
+                                            target.crop[0] as f32,
+                                            target.crop[1] as f32,
+                                            target.crop[2] as f32,
+                                            target.crop[3] as f32,
+                                        ],
                                     );
-                                    let pw = svg_crop[2].round().max(1.0) as u32;
-                                    let ph = svg_crop[3].round().max(1.0) as u32;
-                                    if let Some(mut pixmap) = Pixmap::new(pw, ph) {
-                                        // SVG座標 → crop 内 px。回転は描画時の UV で表現するため含めない
-                                        let ts = usvg::Transform::from_scale(scale_px, scale_px)
-                                            .post_translate(-svg_crop[0], -svg_crop[1]);
-                                        resvg::render(tree, ts, &mut pixmap.as_mut());
-                                        // tiny-skia の出力は premultiplied RGBA なのでそのまま渡す
-                                        let img = egui::ColorImage::from_rgba_premultiplied(
-                                            [pw as usize, ph as usize],
-                                            pixmap.data(),
-                                        );
-                                        match texture.as_mut() {
-                                            Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-                                            None => {
-                                                *texture = Some(ctx.load_texture(
-                                                    "svg_view",
-                                                    img,
-                                                    egui::TextureOptions::LINEAR,
-                                                ))
-                                            }
-                                        }
-                                        *view = Some(SvgView { scale_px, rot: rotation, crop });
+                                    let job = SvgRenderJob {
+                                        scale_px,
+                                        rot: rotation,
+                                        crop: target.crop,
+                                        svg_crop,
+                                    };
+                                    if job_tx.send(job).is_ok() {
+                                        *last_requested = Some(target);
                                     }
                                 }
 
+                                // 描画: テクスチャが保持する領域を現在のビューへ写像して描く。
+                                // スケールが一致していれば 1px=1texel の等倍描画。新しい結果が
+                                // まだ届いていない間は旧テクスチャが引き伸ばされる（ボケるが固まらない）。
+                                let mut drawn = false;
                                 if let (Some(t), Some(v)) = (texture.as_ref(), view.as_ref()) {
-                                    let tex_rect = Rect::from_min_size(
-                                        image_rect.min
-                                            + egui::vec2(v.crop[0] as f32, v.crop[1] as f32) / ppp,
-                                        egui::vec2(v.crop[2] as f32, v.crop[3] as f32) / ppp,
-                                    );
-                                    draw_texture_rotated(ui.painter(), t, tex_rect, v.rot);
+                                    if v.rot == rotation && v.scale_px > 0.0 {
+                                        let factor = scale_px / v.scale_px;
+                                        let tex_rect = Rect::from_min_size(
+                                            image_rect.min
+                                                + egui::vec2(v.crop[0] as f32, v.crop[1] as f32)
+                                                    * factor
+                                                    / ppp,
+                                            egui::vec2(v.crop[2] as f32, v.crop[3] as f32) * factor
+                                                / ppp,
+                                        );
+                                        draw_texture_rotated(ui.painter(), t, tex_rect, v.rot);
+                                        drawn = true;
+                                    }
+                                }
+
+                                if !satisfied {
+                                    // レンダリング待ちを示すスピナー（未描画なら中央、描画済みなら右上に小さく）
+                                    let spinner_rect = if drawn {
+                                        Rect::from_center_size(
+                                            panel_rect.right_top() + egui::vec2(-24.0, 24.0),
+                                            Vec2::splat(18.0),
+                                        )
+                                    } else {
+                                        Rect::from_center_size(panel_rect.center(), Vec2::splat(32.0))
+                                    };
+                                    ui.put(spinner_rect, egui::Spinner::new());
+                                    // 結果の取りこぼし防止の保険（通常はワーカーが repaint を要求する）
+                                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
                                 }
                             }
                         }
