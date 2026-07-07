@@ -1,6 +1,6 @@
 [package]
 name = "MSBT-yuina"
-version = "1.1.2"
+version = "1.2.0"
 edition = "2021"
 authors = ["MSBT"]
 description = "Simple Image Viewer"
@@ -28,11 +28,17 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 rfd = "0.15"
 egui = { version = "0.31", default-features = false }
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Com", "Win32_Graphics_Imaging"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_Graphics_Imaging"] }
 log4rs = "1.3"
-resvg = "0.44"
-usvg = "0.44"
-tiny-skia = "0.11"
+resvg = "0.46"     # CPU ラスタライズ（フォールバック用）。tiny-skia は resvg の再エクスポートを使う
+usvg = "0.46"
+# GPU（wgpu コンピュート）ベクターラスタライザ。コード上は vello_svg の再エクスポート
+# （vello_svg::vello）を使う。vello の直接依存は wgpu_default feature（DX12/Vulkan 等の
+# プラットフォームバックエンド）を有効化するためのもので、バージョンは vello_svg が
+# 要求する 0.7 に合わせること（ずれると型が衝突してコンパイルエラーになる）。
+vello_svg = { version = "0.9", features = ["wgpu"] }
+vello = { version = "0.7", features = ["wgpu_default"] }
+pollster = "0.4"   # wgpu の非同期初期化を同期実行する最小ランタイム
 base64 = "0.22"   # SVG内 @font-face の data URI フォントのデコード
 flate2 = "1"      # .svgz（gzip圧縮SVG）の展開
 ureq = { version = "2", features = ["json"] }  # 自動更新（GitHub Releases API・ダウンロード）

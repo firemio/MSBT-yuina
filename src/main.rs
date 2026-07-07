@@ -20,8 +20,10 @@ use std::panic;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
-use tiny_skia::Pixmap;
+use resvg::tiny_skia::{self, Pixmap};
 use usvg::{Options, Tree};
+// vello はバージョン整合のため vello_svg の再エクスポートを使う
+use vello_svg::vello;
 
 mod updater;
 use updater::UpdateStatus;
@@ -60,6 +62,10 @@ pub struct ViewerConfig {
     /// 起動時に GitHub Releases の新バージョンを確認するかどうか
     #[serde(default = "default_true")]
     pub check_updates: bool,
+    /// SVG を GPU（vello/wgpu）でラスタライズするかどうか。
+    /// 失敗時や未対応機能を含む SVG では自動的に CPU（resvg）へフォールバックする
+    #[serde(default = "default_true")]
+    pub gpu_rendering: bool,
 }
 
 fn default_wheel_zoom_factor() -> f32 {
@@ -78,6 +84,7 @@ impl Default for ViewerConfig {
             wheel_zoom_factor: default_wheel_zoom_factor(),
             smooth_zoom: true,
             check_updates: true,
+            gpu_rendering: true,
         }
     }
 }
@@ -119,12 +126,16 @@ impl ViewerConfig {
              smooth_zoom = {}\n\
              \n\
              # 起動時に新バージョンを確認するかどうか\n\
-             check_updates = {}\n",
+             check_updates = {}\n\
+             \n\
+             # SVGをGPUで描画するかどうか（失敗時は自動でCPUに切り替え）\n\
+             gpu_rendering = {}\n",
             self.initial_display_mode,
             self.enable_debug_log,
             self.wheel_zoom_factor,
             self.smooth_zoom,
-            self.check_updates
+            self.check_updates,
+            self.gpu_rendering
         );
 
         fs::write(config_file, config_template)?;
@@ -341,6 +352,321 @@ fn render_culled(
     }
 }
 
+/// vello（GPU）が解釈できない機能（フィルタ・マスク）を木が使っているか。
+/// 使っている場合は正確性のため CPU（resvg）で描画する。
+fn tree_uses_filters_or_masks(group: &usvg::Group) -> bool {
+    group.children().iter().any(|node| match node {
+        usvg::Node::Group(g) => {
+            !g.filters().is_empty() || g.mask().is_some() || tree_uses_filters_or_masks(g)
+        }
+        _ => false,
+    })
+}
+
+/// 可視範囲と交差するノードだけを vello::Scene へ組み立てる（GPU 版ビューポートカリング）。
+/// vello は画面外のジオメトリもデバイス空間で処理するため、高倍率で全要素を
+/// シーンに入れると内部バッファが溢れて何も描画されなくなる。フラットな木では
+/// ここで可視要素だけを組み立てることで、拡大時ほどシーンが小さく・速く・安全になる。
+/// 個々のノードの描画は vello_svg::render_group（Apache-2.0/MIT）の忠実な移植。
+fn vello_append_culled(
+    scene: &mut vello::Scene,
+    group: &usvg::Group,
+    view: vello::kurbo::Affine,
+    clip: tiny_skia::Rect,
+    drawn: &mut u32,
+    culled: &mut u32,
+) {
+    for node in group.children() {
+        let bbox = node.abs_stroke_bounding_box();
+        let visible = bbox.left() < clip.right()
+            && bbox.right() > clip.left()
+            && bbox.top() < clip.bottom()
+            && bbox.bottom() > clip.top();
+        if !visible {
+            *culled += 1;
+            continue;
+        }
+        match node {
+            // フラットな木なのでグループはレイヤー（合成）を持たない。中へ降りるだけ
+            usvg::Node::Group(g) => vello_append_culled(scene, g, view, clip, drawn, culled),
+            _ => {
+                vello_append_node(scene, node, view);
+                *drawn += 1;
+            }
+        }
+    }
+}
+
+/// 単一ノード（Path/Image/Text）を vello::Scene へ追加する。
+/// vello_svg 0.9 の render.rs と同じセマンティクス（塗り規則・描画順・ブラシ変換）。
+fn vello_append_node(scene: &mut vello::Scene, node: &usvg::Node, view: vello::kurbo::Affine) {
+    use vello::peniko::Fill;
+    use vello_svg::util;
+    let transform = view * util::to_affine(&node.abs_transform());
+    match node {
+        usvg::Node::Group(g) => {
+            // テキスト展開内などに現れる合成付きグループ。レイヤーを張って中を描く
+            let alpha = g.opacity().get();
+            let bb = g.layer_bounding_box();
+            let rect = vello::kurbo::Rect::from_origin_size(
+                (bb.x() as f64, bb.y() as f64),
+                (bb.width() as f64, bb.height() as f64),
+            );
+            scene.push_layer(Fill::NonZero, vello::peniko::Mix::Normal, alpha, transform, &rect);
+            for child in g.children() {
+                vello_append_node(scene, child, view);
+            }
+            scene.pop_layer();
+        }
+        usvg::Node::Path(path) => {
+            if !path.is_visible() {
+                return;
+            }
+            let local_path = util::to_bez_path(path);
+            let do_fill = |scene: &mut vello::Scene| {
+                if let Some(fill) = &path.fill() {
+                    if let Some((brush, brush_transform)) =
+                        util::to_brush(fill.paint(), fill.opacity())
+                    {
+                        scene.fill(
+                            match fill.rule() {
+                                usvg::FillRule::NonZero => Fill::NonZero,
+                                usvg::FillRule::EvenOdd => Fill::EvenOdd,
+                            },
+                            transform,
+                            &brush,
+                            Some(brush_transform),
+                            &local_path,
+                        );
+                    }
+                }
+            };
+            let do_stroke = |scene: &mut vello::Scene| {
+                if let Some(stroke) = &path.stroke() {
+                    if let Some((brush, brush_transform)) =
+                        util::to_brush(stroke.paint(), stroke.opacity())
+                    {
+                        let conv_stroke = util::to_stroke(stroke);
+                        scene.stroke(&conv_stroke, transform, &brush, Some(brush_transform), &local_path);
+                    }
+                }
+            };
+            match path.paint_order() {
+                usvg::PaintOrder::FillAndStroke => {
+                    do_fill(scene);
+                    do_stroke(scene);
+                }
+                usvg::PaintOrder::StrokeAndFill => {
+                    do_stroke(scene);
+                    do_fill(scene);
+                }
+            }
+        }
+        usvg::Node::Image(img) => {
+            if !img.is_visible() {
+                return;
+            }
+            match img.kind() {
+                usvg::ImageKind::JPEG(_)
+                | usvg::ImageKind::PNG(_)
+                | usvg::ImageKind::GIF(_)
+                | usvg::ImageKind::WEBP(_) => {
+                    if let Ok(decoded) = util::decode_raw_raster_image(img.kind()) {
+                        let image = util::into_image(decoded);
+                        scene.draw_image(&image, transform);
+                    }
+                }
+                usvg::ImageKind::SVG(svg) => {
+                    for child in svg.root().children() {
+                        vello_append_node(scene, child, transform);
+                    }
+                }
+            }
+        }
+        usvg::Node::Text(text) => {
+            for child in text.flattened().children() {
+                vello_append_node(scene, child, transform);
+            }
+        }
+    }
+}
+
+/// GPU（vello/wgpu）による SVG ラスタライザ。
+/// ヘッドレスの wgpu デバイスを持ち、vello::Scene を GPU コンピュートで
+/// ラスタライズして結果を CPU へ読み戻す。読み戻しは画面サイズ程度（数MB）なので
+/// 数msで済み、ラスタライズ本体が大規模並列になるぶん圧倒的に速い。
+struct GpuRenderer {
+    device: vello::wgpu::Device,
+    queue: vello::wgpu::Queue,
+    renderer: vello::Renderer,
+    /// SVG 全体を変換済みのシーン（非フラットな木でのみ遅延構築）
+    whole_scene: Option<vello::Scene>,
+    adapter_name: String,
+}
+
+impl GpuRenderer {
+    fn new() -> Result<Self, String> {
+        use vello::wgpu;
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        }))
+        .map_err(|e| format!("GPUアダプタが見つかりません: {e}"))?;
+        let info = adapter.get_info();
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("MSBT-yuina svg renderer"),
+            ..Default::default()
+        }))
+        .map_err(|e| format!("GPUデバイスの作成に失敗: {e}"))?;
+        let renderer = vello::Renderer::new(&device, vello::RendererOptions::default())
+            .map_err(|e| format!("vello の初期化に失敗: {e}"))?;
+        Ok(Self {
+            device,
+            queue,
+            renderer,
+            whole_scene: None,
+            adapter_name: info.name,
+        })
+    }
+
+    /// 1 ジョブぶんをレンダリングする。戻り値は (画像, 描画ノード数, カリング数)。
+    /// flat な木では可視ノードだけのシーンを組み立てる（GPU 版カリング）。
+    fn render(
+        &mut self,
+        tree: &Tree,
+        flat: bool,
+        job: &SvgRenderJob,
+    ) -> Result<(egui::ColorImage, u32, u32), String> {
+        use vello::wgpu;
+        let pw = job.svg_crop[2].round().max(1.0) as u32;
+        let ph = job.svg_crop[3].round().max(1.0) as u32;
+
+        // SVG座標 → crop 内 px（回転は描画時の UV で表現するため含めない）
+        let s = job.scale_px as f64;
+        let affine = vello::kurbo::Affine::new([
+            s,
+            0.0,
+            0.0,
+            s,
+            -(job.svg_crop[0] as f64),
+            -(job.svg_crop[1] as f64),
+        ]);
+        let mut scene = vello::Scene::new();
+        let (mut drawn, mut culled) = (0u32, 0u32);
+        if flat {
+            // 可視範囲（ユーザー座標）。AA のにじみ分を少し広げる
+            let pad = 2.0 / job.scale_px.max(f32::EPSILON);
+            let clip = tiny_skia::Rect::from_xywh(
+                job.svg_crop[0] / job.scale_px - pad,
+                job.svg_crop[1] / job.scale_px - pad,
+                job.svg_crop[2] / job.scale_px + pad * 2.0,
+                job.svg_crop[3] / job.scale_px + pad * 2.0,
+            )
+            .ok_or("可視範囲の計算に失敗")?;
+            vello_append_culled(&mut scene, tree.root(), affine, clip, &mut drawn, &mut culled);
+        } else {
+            let whole = self
+                .whole_scene
+                .get_or_insert_with(|| vello_svg::render_tree(tree));
+            scene.append(whole, Some(affine));
+        }
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("svg_target"),
+            size: wgpu::Extent3d {
+                width: pw,
+                height: ph,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.renderer
+            .render_to_texture(
+                &self.device,
+                &self.queue,
+                &scene,
+                &view,
+                &vello::RenderParams {
+                    base_color: vello::peniko::Color::TRANSPARENT,
+                    width: pw,
+                    height: ph,
+                    antialiasing_method: vello::AaConfig::Area,
+                },
+            )
+            .map_err(|e| format!("GPUレンダリングに失敗: {e}"))?;
+
+        // GPU → CPU 読み戻し（bytes_per_row は 256 バイト境界に揃える必要がある）
+        let bpr = (pw * 4).next_multiple_of(256);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("svg_readback"),
+            size: bpr as u64 * ph as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: pw,
+                height: ph,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+
+        let slice = buffer.slice(..);
+        let (map_tx, map_rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = map_tx.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .map_err(|e| format!("GPUの完了待ちに失敗: {e:?}"))?;
+        map_rx
+            .recv()
+            .map_err(|_| "GPU読み戻しの完了通知が来ません".to_string())?
+            .map_err(|e| format!("GPU読み戻しに失敗: {e:?}"))?;
+
+        let data = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity((pw * ph * 4) as usize);
+        for row in 0..ph {
+            let start = (row * bpr) as usize;
+            pixels.extend_from_slice(&data[start..start + (pw * 4) as usize]);
+        }
+        drop(data);
+        buffer.unmap();
+        // vello の出力は premultiplied RGBA
+        Ok((
+            egui::ColorImage::from_rgba_premultiplied([pw as usize, ph as usize], &pixels),
+            drawn,
+            culled,
+        ))
+    }
+}
+
 /// SVG ラスタライズ用のワーカースレッドを起動する。
 /// 精密な SVG は 1 回のラスタライズに時間がかかるため UI スレッドでは行わず、
 /// ここで処理する。チャンネルに溜まった要求は最新の 1 件だけを処理する
@@ -348,21 +674,39 @@ fn render_culled(
 /// 送信側（LoadedImage::Svg）が破棄されるとスレッドは自動終了する。
 fn spawn_svg_render_worker(
     tree: Tree,
+    use_gpu: bool,
     ctx: egui::Context,
 ) -> (mpsc::Sender<SvgRenderJob>, mpsc::Receiver<SvgRenderResult>) {
     let (job_tx, job_rx) = mpsc::channel::<SvgRenderJob>();
     let (result_tx, result_rx) = mpsc::channel::<SvgRenderResult>();
     std::thread::spawn(move || {
-        // フラットな木（グループ効果なし）なら視野外カリングが安全に使える
+        // フラットな木（グループ効果なし）なら CPU パスで視野外カリングが安全に使える
         let flat = tree_is_flat(tree.root());
-        info!(
-            "SVG構造解析: {}",
-            if flat {
-                "フラット — 視野外カリング有効（拡大時ほど軽くなる）"
-            } else {
-                "グループ効果あり — 全体描画にフォールバック"
+        // GPU: vello が解釈できる木なら GPU ラスタライザを初期化。
+        // 失敗・未対応時は CPU（resvg）へフォールバックする。
+        let mut gpu = if use_gpu && !tree_uses_filters_or_masks(tree.root()) {
+            match GpuRenderer::new() {
+                Ok(g) => {
+                    info!("SVGレンダラ: GPU — vello / {}", g.adapter_name);
+                    Some(g)
+                }
+                Err(e) => {
+                    info!("GPU初期化に失敗したため CPU で描画します: {e}");
+                    None
+                }
             }
-        );
+        } else {
+            if use_gpu {
+                info!("フィルタ/マスクを含む SVG のため CPU（resvg）で描画します");
+            }
+            None
+        };
+        if gpu.is_none() {
+            info!(
+                "SVGレンダラ: CPU — resvg{}",
+                if flat { "（視野外カリング有効）" } else { "" }
+            );
+        }
         while let Ok(mut job) = job_rx.recv() {
             // 最新の要求だけを残す
             while let Ok(newer) = job_rx.try_recv() {
@@ -370,42 +714,79 @@ fn spawn_svg_render_worker(
             }
             let pw = job.svg_crop[2].round().max(1.0) as u32;
             let ph = job.svg_crop[3].round().max(1.0) as u32;
-            let Some(mut pixmap) = Pixmap::new(pw, ph) else {
-                error!("SVGレンダリング用のバッファを確保できません: {}x{}", pw, ph);
-                continue;
-            };
             let started = std::time::Instant::now();
-            // SVG座標 → crop 内 px。回転は描画時の UV で表現するため含めない
-            let ts = usvg::Transform::from_scale(job.scale_px, job.scale_px)
-                .post_translate(-job.svg_crop[0], -job.svg_crop[1]);
-            // 可視範囲をユーザー座標へ戻し、AA のにじみ分だけ少し広げる
-            let pad = 2.0 / job.scale_px.max(f32::EPSILON);
-            let clip = tiny_skia::Rect::from_xywh(
-                job.svg_crop[0] / job.scale_px - pad,
-                job.svg_crop[1] / job.scale_px - pad,
-                job.svg_crop[2] / job.scale_px + pad * 2.0,
-                job.svg_crop[3] / job.scale_px + pad * 2.0,
-            );
+
+            // まず GPU で試し、失敗したら以後は CPU に切り替える。
+            // 非フラットな木は全体シーンを append する方式のため、デバイス空間の全体サイズが
+            // 大きすぎると vello の内部バッファが溢れて空の出力になる。その場合は CPU を使う。
+            let mut image: Option<egui::ColorImage> = None;
+            let mut backend = "GPU";
             let (mut drawn, mut culled) = (0u32, 0u32);
-            match (flat, clip) {
-                (true, Some(clip)) => {
-                    render_culled(tree.root(), clip, ts, &mut pixmap.as_mut(), &mut drawn, &mut culled)
+            let gpu_usable_now = flat || {
+                let size = tree.size();
+                size.width() * job.scale_px <= 4096.0 && size.height() * job.scale_px <= 4096.0
+            };
+            if let Some(g) = gpu.as_mut() {
+                if gpu_usable_now {
+                    match g.render(&tree, flat, &job) {
+                        Ok((img, d, c)) => {
+                            image = Some(img);
+                            drawn = d;
+                            culled = c;
+                        }
+                        Err(e) => {
+                            error!("GPU描画に失敗したため、以後 CPU で描画します: {e}");
+                            gpu = None;
+                        }
+                    }
                 }
-                _ => resvg::render(&tree, ts, &mut pixmap.as_mut()),
             }
+            let image = match image {
+                Some(img) => img,
+                None => {
+                    backend = "CPU";
+                    let Some(mut pixmap) = Pixmap::new(pw, ph) else {
+                        error!("SVGレンダリング用のバッファを確保できません: {}x{}", pw, ph);
+                        continue;
+                    };
+                    // SVG座標 → crop 内 px。回転は描画時の UV で表現するため含めない
+                    let ts = usvg::Transform::from_scale(job.scale_px, job.scale_px)
+                        .post_translate(-job.svg_crop[0], -job.svg_crop[1]);
+                    // 可視範囲をユーザー座標へ戻し、AA のにじみ分だけ少し広げる
+                    let pad = 2.0 / job.scale_px.max(f32::EPSILON);
+                    let clip = tiny_skia::Rect::from_xywh(
+                        job.svg_crop[0] / job.scale_px - pad,
+                        job.svg_crop[1] / job.scale_px - pad,
+                        job.svg_crop[2] / job.scale_px + pad * 2.0,
+                        job.svg_crop[3] / job.scale_px + pad * 2.0,
+                    );
+                    match (flat, clip) {
+                        (true, Some(clip)) => render_culled(
+                            tree.root(),
+                            clip,
+                            ts,
+                            &mut pixmap.as_mut(),
+                            &mut drawn,
+                            &mut culled,
+                        ),
+                        _ => resvg::render(&tree, ts, &mut pixmap.as_mut()),
+                    }
+                    // tiny-skia の出力は premultiplied RGBA なのでそのまま渡す
+                    egui::ColorImage::from_rgba_premultiplied(
+                        [pw as usize, ph as usize],
+                        pixmap.data(),
+                    )
+                }
+            };
             debug!(
-                "SVGレンダリング: {}x{} scale_px={:.2} ({} ms, 描画 {} / カリング {})",
+                "SVGレンダリング[{}]: {}x{} scale_px={:.2} ({} ms, 描画 {} / カリング {})",
+                backend,
                 pw,
                 ph,
                 job.scale_px,
                 started.elapsed().as_millis(),
                 drawn,
                 culled
-            );
-            // tiny-skia の出力は premultiplied RGBA なのでそのまま渡す
-            let image = egui::ColorImage::from_rgba_premultiplied(
-                [pw as usize, ph as usize],
-                pixmap.data(),
             );
             let result = SvgRenderResult {
                 view: SvgView {
@@ -1042,7 +1423,8 @@ impl ImageViewer {
         self.image_size = Some([w.ceil() as u32, h.ceil() as u32]);
         // Tree はワーカースレッドへ移動し、以後のラスタライズはすべてそちらで行う。
         // 前の画像のワーカーは、旧 LoadedImage が破棄されて送信側が閉じると自動終了する。
-        let (job_tx, result_rx) = spawn_svg_render_worker(tree, ctx.clone());
+        let (job_tx, result_rx) =
+            spawn_svg_render_worker(tree, self.config.gpu_rendering, ctx.clone());
         self.current_image = Some(LoadedImage::Svg {
             size: [w, h],
             texture: None,
@@ -1304,6 +1686,29 @@ impl ImageViewer {
                                 .logarithmic(true)
                                 .text("Wheel zoom speed"),
                         );
+                        if ui
+                            .checkbox(&mut self.config.gpu_rendering, "GPU SVG rendering")
+                            .changed()
+                        {
+                            // ワーカーの構成が変わるため SVG を読み直して反映する
+                            if let Some(LoadedImage::Svg { path, .. }) = &self.current_image {
+                                let path = path.clone();
+                                let keep = (
+                                    self.scale,
+                                    self.pan_offset,
+                                    self.last_available_size,
+                                    self.rotation,
+                                );
+                                if self.load_image(&path, ctx) {
+                                    (
+                                        self.scale,
+                                        self.pan_offset,
+                                        self.last_available_size,
+                                        self.rotation,
+                                    ) = keep;
+                                }
+                            }
+                        }
                     });
 
                     ui.add_space(8.0);
@@ -2232,11 +2637,8 @@ mod tests {
         );
     }
 
-    /// 性能計測（cargo test --release perf_culled -- --ignored --nocapture で実行）
-    #[test]
-    #[ignore]
-    fn perf_culled_zoom_vs_full() {
-        let opt = Options::default();
+    /// 40,000 個のストローク円を散らした精密 SVG（性能テスト用）
+    fn build_heavy_svg() -> String {
         let mut svg = String::from(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="2000">"#,
         );
@@ -2252,7 +2654,150 @@ mod tests {
             ));
         }
         svg.push_str("</svg>");
-        let tree = Tree::from_str(&svg, &opt).unwrap();
+        svg
+    }
+
+    /// GPU 描画が CPU 描画とおおよそ同じ絵を出すこと（被覆率で比較。
+    /// ラスタライザが違うため AA は完全一致しない）。GPU 必須のため ignored。
+    #[test]
+    #[ignore]
+    fn live_gpu_render_matches_cpu_roughly() {
+        let opt = Options::default();
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+            <circle cx="30" cy="30" r="20" fill="#c33"/>
+            <rect x="50" y="55" width="40" height="30" fill="none" stroke="#357" stroke-width="3"/>
+            <path d="M 10 80 Q 50 40 90 80" fill="none" stroke="#181" stroke-width="2"/>
+        </svg>"##;
+        let tree = Tree::from_str(svg, &opt).unwrap();
+        assert!(tree_is_flat(tree.root()));
+        let mut gpu = match GpuRenderer::new() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skip: GPU が使えません: {e}");
+                return;
+            }
+        };
+        let job = SvgRenderJob {
+            scale_px: 2.0,
+            rot: 0,
+            crop: [0, 0, 200, 200],
+            svg_crop: [0.0, 0.0, 200.0, 200.0],
+        };
+        let (img, _, _) = gpu.render(&tree, true, &job).expect("GPU描画に失敗");
+        assert_eq!(img.size, [200, 200]);
+
+        let mut pixmap = Pixmap::new(200, 200).unwrap();
+        resvg::render(
+            &tree,
+            usvg::Transform::from_scale(2.0, 2.0),
+            &mut pixmap.as_mut(),
+        );
+        let gpu_opaque = img.pixels.iter().filter(|p| p.a() > 8).count();
+        let cpu_opaque = pixmap.pixels().iter().filter(|p| p.alpha() > 8).count();
+        println!("被覆率: GPU {gpu_opaque} px / CPU {cpu_opaque} px");
+        assert!(gpu_opaque > 500, "GPU出力がほぼ空: {gpu_opaque}");
+        let ratio = gpu_opaque as f64 / cpu_opaque.max(1) as f64;
+        assert!(
+            (0.85..=1.15).contains(&ratio),
+            "GPU/CPU の被覆率が乖離: {ratio:.3}"
+        );
+    }
+
+    /// GPU カリングにより、どの倍率・位置でも出力が空にならないことの実機確認。
+    /// （カリング無しの全体シーン方式では、高倍率で vello の内部バッファが溢れて
+    /// 全ケース空になることを確認済み — それが gpu_usable_now ガードの理由）
+    #[test]
+    #[ignore]
+    fn live_gpu_culled_zoom_not_blank() {
+        let opt = Options::default();
+        let tree = Tree::from_str(&build_heavy_svg(), &opt).unwrap();
+        assert!(tree_is_flat(tree.root()));
+        let mut gpu = match GpuRenderer::new() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skip: {e}");
+                return;
+            }
+        };
+        let cases = [
+            ("scale20 origin", 20.0f32, [0u32, 0, 1000, 1000]),
+            ("scale20 t=15000", 20.0, [15000, 15000, 1000, 1000]),
+            ("scale20 t=30000", 20.0, [30000, 30000, 1000, 1000]),
+            ("scale5 t=3750", 5.0, [3750, 3750, 1000, 1000]),
+            ("scale0.43 origin", 0.43, [0, 0, 860, 860]),
+        ];
+        for (label, scale, crop) in cases {
+            let job = SvgRenderJob {
+                scale_px: scale,
+                rot: 0,
+                crop,
+                svg_crop: [crop[0] as f32, crop[1] as f32, crop[2] as f32, crop[3] as f32],
+            };
+            let (img, drawn, culled) = gpu.render(&tree, true, &job).expect(label);
+            let opaque = img.pixels.iter().filter(|p| p.a() > 0).count();
+            println!("{label}: 不透過 {opaque} px（描画 {drawn} / カリング {culled}）");
+            assert!(opaque > 0, "{label} が空");
+        }
+    }
+
+    /// GPU vs CPU の性能比較（cargo test --release perf_gpu -- --ignored --nocapture）
+    #[test]
+    #[ignore]
+    fn perf_gpu_vs_cpu() {
+        let opt = Options::default();
+        let tree = Tree::from_str(&build_heavy_svg(), &opt).unwrap();
+        let mut gpu = match GpuRenderer::new() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skip: GPU が使えません: {e}");
+                return;
+            }
+        };
+        // 全景（フィット相当: 0.43倍 ≒ 860x860）と拡大20倍の両方を測る
+        let cases = [
+            ("全景 0.43x", 0.43f32, [0u32, 0, 860, 860]),
+            ("拡大 20x", 20.0f32, [15000u32, 15000, 1000, 1000]),
+        ];
+        for (label, scale, crop) in cases {
+            let job = SvgRenderJob {
+                scale_px: scale,
+                rot: 0,
+                crop,
+                svg_crop: [crop[0] as f32, crop[1] as f32, crop[2] as f32, crop[3] as f32],
+            };
+            // 初回はシェーダコンパイル等があるためウォームアップ
+            let _ = gpu.render(&tree, true, &job);
+            let t0 = std::time::Instant::now();
+            let (img, _, _) = gpu.render(&tree, true, &job).expect("GPU描画に失敗");
+            let gpu_ms = t0.elapsed().as_millis();
+            assert!(img.pixels.iter().any(|p| p.a() > 0));
+
+            let mut pixmap = Pixmap::new(crop[2], crop[3]).unwrap();
+            let ts = usvg::Transform::from_scale(scale, scale)
+                .post_translate(-(crop[0] as f32), -(crop[1] as f32));
+            let clip = tiny_skia::Rect::from_xywh(
+                crop[0] as f32 / scale,
+                crop[1] as f32 / scale,
+                crop[2] as f32 / scale,
+                crop[3] as f32 / scale,
+            )
+            .unwrap();
+            let (mut drawn, mut culled) = (0u32, 0u32);
+            let t1 = std::time::Instant::now();
+            render_culled(tree.root(), clip, ts, &mut pixmap.as_mut(), &mut drawn, &mut culled);
+            let cpu_ms = t1.elapsed().as_millis();
+            println!(
+                "{label}: GPU {gpu_ms} ms / CPU(カリング) {cpu_ms} ms（CPU側 描画 {drawn}, カリング {culled}）"
+            );
+        }
+    }
+
+    /// 性能計測（cargo test --release perf_culled -- --ignored --nocapture で実行）
+    #[test]
+    #[ignore]
+    fn perf_culled_zoom_vs_full() {
+        let opt = Options::default();
+        let tree = Tree::from_str(&build_heavy_svg(), &opt).unwrap();
         assert!(tree_is_flat(tree.root()));
 
         // 拡大 20 倍で 1000x1000 の可視領域（画面相当）を描く
