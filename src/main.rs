@@ -1,34 +1,46 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use eframe::egui::{self, Color32, Key, Rect, Vec2, Pos2};
+use eframe::egui::{self, Color32, Key, Pos2, Rect, Vec2};
 use egui::IconData;
-use std::fs;
-use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use ico;
+use image;
 use log::{error, info, LevelFilter};
 use log4rs::{
     append::file::FileAppender,
     config::{Appender, Config, Root},
     encode::pattern::PatternEncoder,
 };
-use std::panic;
-use std::sync::Arc;
-use ico;
-use serde::{Deserialize, Serialize};
-use tiny_skia::Pixmap;
-use usvg::{Options, Tree};
 use resvg;
 use rfd;
-use image;
+use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
+use std::fs;
+use std::io::Cursor;
+use std::panic;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tiny_skia::Pixmap;
+use usvg::{Options, Tree};
+
+mod updater;
+use updater::UpdateStatus;
 
 /// 対応する画像拡張子。image クレートでデコードできるもの（png/jpg/gif/webp/bmp/tiff/ico/tga/
-/// dds/exr/hdr/qoi/pnm 系）に加え、WIC フォールバックで開ける形式（heic/heif/avif/jxr 等）と svg。
-/// File ダイアログのフィルタとフォルダ送りの判定で共通利用する。
+/// dds/exr/hdr/qoi/pnm 系）に加え、WIC フォールバックで開ける形式（heic/heif/avif/jxr 等）と
+/// svg/svgz。File ダイアログのフィルタとフォルダ送りの判定で共通利用する。
 const SUPPORTED_EXTS: &[&str] = &[
-    "png", "jpg", "jpeg", "jfif", "gif", "webp", "bmp", "dib", "svg", "heic", "heif", "avif", "tif",
-    "tiff", "ico", "tga", "dds", "exr", "hdr", "qoi", "pnm", "ppm", "pgm", "pbm", "pam", "ff",
-    "farbfeld", "jxr", "wdp",
+    "png", "jpg", "jpeg", "jfif", "gif", "webp", "bmp", "dib", "svg", "svgz", "heic", "heif",
+    "avif", "tif", "tiff", "ico", "tga", "dds", "exr", "hdr", "qoi", "pnm", "ppm", "pgm", "pbm",
+    "pam", "ff", "farbfeld", "jxr", "wdp",
 ];
+
+/// 拡大率の下限・上限
+const MIN_SCALE: f32 = 0.02;
+const MAX_SCALE: f32 = 64.0;
+/// +/- キー1回あたりのズーム倍率
+const KEY_ZOOM_STEP: f32 = 1.2;
+/// SVG のパン中の再レンダリング回数を減らすため、可視領域の外側に付ける描画余白（物理px）
+const SVG_RENDER_MARGIN_PX: f32 = 256.0;
 
 /// 設定ファイル（TOML）の内容
 #[derive(Serialize, Deserialize, Debug)]
@@ -41,10 +53,20 @@ pub struct ViewerConfig {
     /// マウスホイールの拡大率（1回の回転あたりの倍率）
     #[serde(default = "default_wheel_zoom_factor")]
     pub wheel_zoom_factor: f32,
+    /// 拡大表示の補間。true=滑らか（バイリニア）、false=ピクセル等倍（ニアレスト）
+    #[serde(default = "default_true")]
+    pub smooth_zoom: bool,
+    /// 起動時に GitHub Releases の新バージョンを確認するかどうか
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
 }
 
 fn default_wheel_zoom_factor() -> f32 {
     0.001
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for ViewerConfig {
@@ -53,6 +75,8 @@ impl Default for ViewerConfig {
             initial_display_mode: "fit".to_string(),
             enable_debug_log: false,
             wheel_zoom_factor: default_wheel_zoom_factor(),
+            smooth_zoom: true,
+            check_updates: true,
         }
     }
 }
@@ -78,7 +102,7 @@ impl ViewerConfig {
             .ok_or("Failed to get executable name")?
             .to_string_lossy();
         let config_file = format!("{}.toml", exe_name);
-        
+
         // 設定ファイルのテンプレート
         let config_template = format!(
             "# 初期表示モード: \"fit\"=画面に合わせて表示, \"original\"=原寸大(100%)\n\
@@ -88,12 +112,20 @@ impl ViewerConfig {
              enable_debug_log = {}\n\
              \n\
              # マウスホイールの拡大率（1回の回転あたりの倍率）\n\
-             wheel_zoom_factor = {}\n",
+             wheel_zoom_factor = {}\n\
+             \n\
+             # 拡大表示の補間: true=滑らか(バイリニア), false=ピクセル等倍(ニアレスト)\n\
+             smooth_zoom = {}\n\
+             \n\
+             # 起動時に新バージョンを確認するかどうか\n\
+             check_updates = {}\n",
             self.initial_display_mode,
             self.enable_debug_log,
-            self.wheel_zoom_factor
+            self.wheel_zoom_factor,
+            self.smooth_zoom,
+            self.check_updates
         );
-        
+
         fs::write(config_file, config_template)?;
         Ok(())
     }
@@ -170,7 +202,7 @@ fn main() -> eframe::Result<()> {
     } else {
         None
     };
-    
+
     if let Some(path) = &initial_image {
         info!("コマンドライン引数で指定された画像: {}", path.display());
     }
@@ -202,7 +234,7 @@ fn main() -> eframe::Result<()> {
 
 fn create_app_options() -> Result<eframe::NativeOptions, Box<dyn std::error::Error>> {
     info!("アプリケーション設定の作成開始");
-    
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
@@ -219,9 +251,19 @@ fn create_app_options() -> Result<eframe::NativeOptions, Box<dyn std::error::Err
     Ok(options)
 }
 
-/// 読み込んだ画像の種類を表す型  
-/// Raster: 通常画像  
-/// Svg: SVG の場合、usvg::Tree と元のサイズ、現在のテクスチャ、最後にレンダリングした scale を保持
+/// SVG テクスチャが現在保持している描画領域。
+/// crop は「回転適用後の表示空間」における物理 px の矩形 [x, y, w, h]（画像原点基準）。
+struct SvgView {
+    /// SVG のユーザー単位 → 物理 px の倍率（表示倍率 × pixels_per_point）
+    scale_px: f32,
+    /// 90°単位の回転（0..=3、時計回り）
+    rot: u8,
+    crop: [u32; 4],
+}
+
+/// 読み込んだ画像の種類を表す型
+/// Raster: 通常画像
+/// Svg: usvg::Tree を保持し、表示のたびに可視領域だけを表示解像度でラスタライズする
 enum LoadedImage {
     Raster {
         texture: egui::TextureHandle,
@@ -229,9 +271,12 @@ enum LoadedImage {
     },
     Svg {
         tree: Tree,
-        original_size: [u32; 2],
-        texture: egui::TextureHandle,
-        last_scale: f32,
+        /// SVG 本来のサイズ（ユーザー単位 ＝ 等倍時の論理 px）
+        size: [f32; 2],
+        /// 直近にラスタライズした可視領域のテクスチャ（初回描画時に生成）
+        texture: Option<egui::TextureHandle>,
+        /// texture が保持している領域の情報
+        view: Option<SvgView>,
         path: PathBuf,
     },
 }
@@ -303,7 +348,7 @@ impl MouseGesture {
                     };
 
                     if let Some(dir) = direction {
-                        if self.directions.len() < 5 && 
+                        if self.directions.len() < 5 &&
                            self.directions.last().map_or(true, |last| *last != dir) {
                             self.directions.push(dir);
                         }
@@ -372,6 +417,217 @@ impl MouseGesture {
     }
 }
 
+/// 90°単位の回転を適用した (幅, 高さ)
+fn rotated_dims(w: f32, h: f32, rot: u8) -> (f32, f32) {
+    if rot % 2 == 1 {
+        (h, w)
+    } else {
+        (w, h)
+    }
+}
+
+/// 表示空間（時計回りに rot×90° 回転した後の空間）の矩形 [x,y,w,h] を、
+/// 回転前の SVG 空間の矩形へ写像する。ws/hs は SVG 空間の全体サイズ。
+/// 単位は呼び出し側で一貫していれば何でもよい（ここでは物理 px を渡す）。
+fn map_display_crop_to_svg(rot: u8, ws: f32, hs: f32, crop: [f32; 4]) -> [f32; 4] {
+    let [dx, dy, dw, dh] = crop;
+    match rot % 4 {
+        0 => [dx, dy, dw, dh],
+        // 90° 時計回り: SVG の (x,y) は表示 (hs - y, x) に現れる
+        1 => [dy, hs - dx - dw, dh, dw],
+        2 => [ws - dx - dw, hs - dy - dh, dw, dh],
+        // 270° 時計回り: SVG の (x,y) は表示 (y, ws - x) に現れる
+        _ => [ws - dy - dh, dx, dh, dw],
+    }
+}
+
+/// テクスチャを rot×90°（時計回り）回転させて rect に描画する。
+/// egui::Image は非正方形の 90° 回転を素直に扱えないため、UV を回した Mesh で描く。
+fn draw_texture_rotated(painter: &egui::Painter, texture: &egui::TextureHandle, rect: Rect, rot: u8) {
+    use egui::epaint::{Mesh, Vertex};
+    let mut mesh = Mesh::with_texture(texture.id());
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ];
+    let base = [
+        egui::pos2(0.0, 0.0),
+        egui::pos2(1.0, 0.0),
+        egui::pos2(1.0, 1.0),
+        egui::pos2(0.0, 1.0),
+    ];
+    for (i, corner) in corners.iter().enumerate() {
+        mesh.vertices.push(Vertex {
+            pos: *corner,
+            uv: base[(i + 4 - rot as usize % 4) % 4],
+            color: Color32::WHITE,
+        });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// SVG 描画範囲の1軸ぶんを決める。可視区間 [n0, n1] を優先しつつ余白 margin を付け、
+/// 画像全体 full と GPU 上限 max_dim に収める。戻り値は (開始, 幅) の整数px。
+/// 可視区間そのものが max_dim を超える場合は中央の max_dim 窓に絞る（単一テクスチャでは
+/// 描ききれないため。この場合でも戻り値は決定的なので、ビューが動かない限り再描画されない）。
+fn crop_axis(n0: f32, n1: f32, full: f32, margin: f32, max_dim: f32) -> (u32, u32) {
+    let n0 = n0.clamp(0.0, full);
+    let n1 = n1.clamp(n0, full);
+    let (v0, v1) = if n1 - n0 > max_dim {
+        let start = ((n0 + n1 - max_dim) * 0.5)
+            .clamp(0.0, (full - max_dim).max(0.0))
+            .floor();
+        (start, start + max_dim)
+    } else {
+        (n0, n1)
+    };
+    // 余白は max_dim に収まる範囲でだけ付ける（左右均等）
+    let slack = (max_dim - (v1 - v0)).max(0.0);
+    let m = margin.min(slack * 0.5);
+    let c0 = (v0 - m).max(0.0).floor();
+    let c1 = (v1 + m).min(full).ceil();
+    let w = ((c1 - c0).round() as u32).clamp(1, max_dim as u32);
+    (c0 as u32, w)
+}
+
+/// エクスプローラー風の自然順ソート比較（数値の並びを数として比較、英字は大文字小文字無視）。
+/// 例: img2.png < img10.png
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let mut ai = a.chars().peekable();
+    let mut bi = b.chars().peekable();
+    loop {
+        match (ai.peek().copied(), bi.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(ca), Some(cb)) => {
+                if ca.is_ascii_digit() && cb.is_ascii_digit() {
+                    let mut na = String::new();
+                    while let Some(&c) = ai.peek() {
+                        if c.is_ascii_digit() {
+                            na.push(c);
+                            ai.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    let mut nb = String::new();
+                    while let Some(&c) = bi.peek() {
+                        if c.is_ascii_digit() {
+                            nb.push(c);
+                            bi.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    // 先頭ゼロを除いた桁数 → 辞書順 → 元の長さ（"01" と "1" の安定化）で比較
+                    let ta = na.trim_start_matches('0');
+                    let tb = nb.trim_start_matches('0');
+                    let ord = ta
+                        .len()
+                        .cmp(&tb.len())
+                        .then_with(|| ta.cmp(tb))
+                        .then_with(|| na.len().cmp(&nb.len()));
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                } else {
+                    let la = ca.to_lowercase().next().unwrap_or(ca);
+                    let lb = cb.to_lowercase().next().unwrap_or(cb);
+                    if la != lb {
+                        return la.cmp(&lb);
+                    }
+                    ai.next();
+                    bi.next();
+                }
+            }
+        }
+    }
+}
+
+/// gzip 圧縮されたデータ（.svgz）なら展開して返す。それ以外はそのまま返す。
+fn decompress_if_gzip(raw: Vec<u8>) -> Result<Vec<u8>, String> {
+    if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
+        use std::io::Read as _;
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(raw.as_slice())
+            .read_to_end(&mut out)
+            .map_err(|e| format!("svgz の展開に失敗しました: {e}"))?;
+        Ok(out)
+    } else {
+        Ok(raw)
+    }
+}
+
+/// fontdb が読めるフォント形式（TTF/OTF/TTC）かをマジックバイトで判定する。
+/// WOFF/WOFF2 は変換が必要なため対象外。
+fn is_supported_font(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && matches!(&bytes[..4], b"\x00\x01\x00\x00" | b"OTTO" | b"true" | b"ttcf")
+}
+
+/// SVG 中の @font-face 宣言から埋め込みフォント（data URI）やローカルファイル参照を抽出し、
+/// フォント DB へ登録する。usvg は @font-face を解釈しないため、ここで補う。
+/// 読み込めたフォント数を返す。
+fn load_embedded_fonts(svg_text: &str, db: &mut usvg::fontdb::Database, base_dir: Option<&Path>) -> usize {
+    use base64::Engine as _;
+    let mut loaded = 0;
+    let mut rest = svg_text;
+    while let Some(pos) = rest.find("@font-face") {
+        rest = &rest[pos + "@font-face".len()..];
+        let Some(open) = rest.find('{') else { break };
+        let Some(close_rel) = rest[open..].find('}') else { break };
+        let block = &rest[open + 1..open + close_rel];
+
+        // ブロック内の url(...) を列挙する
+        let mut b = block;
+        while let Some(u) = b.find("url(") {
+            b = &b[u + 4..];
+            let Some(end) = b.find(')') else { break };
+            let raw_url = b[..end]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'')
+                .trim();
+            if let Some(data) = raw_url.strip_prefix("data:") {
+                // data URI（base64 埋め込みフォント）
+                if let Some(comma) = data.find(',') {
+                    let (meta, payload) = data.split_at(comma);
+                    if meta.contains("base64") {
+                        let cleaned: String =
+                            payload[1..].chars().filter(|c| !c.is_whitespace()).collect();
+                        match base64::engine::general_purpose::STANDARD.decode(cleaned.as_bytes()) {
+                            Ok(bytes) if is_supported_font(&bytes) => {
+                                db.load_font_data(bytes);
+                                loaded += 1;
+                            }
+                            Ok(_) => {
+                                info!("@font-face: 未対応のフォント形式（WOFF/WOFF2 等）をスキップしました");
+                            }
+                            Err(e) => info!("@font-face: base64 のデコードに失敗: {e}"),
+                        }
+                    }
+                }
+            } else if !raw_url.contains("://") {
+                // SVG ファイルからの相対パス参照
+                if let Some(dir) = base_dir {
+                    let font_path = dir.join(raw_url);
+                    if let Ok(bytes) = fs::read(&font_path) {
+                        if is_supported_font(&bytes) {
+                            db.load_font_data(bytes);
+                            loaded += 1;
+                        }
+                    }
+                }
+            }
+            b = &b[end..];
+        }
+        rest = &rest[open + close_rel..];
+    }
+    loaded
+}
+
 struct ImageViewer {
     config: ViewerConfig,
     current_image: Option<LoadedImage>,
@@ -379,6 +635,8 @@ struct ImageViewer {
     image_size: Option<[u32; 2]>,
     scale: f32,
     pan_offset: Vec2,
+    /// 90°単位の回転（0..=3、時計回り）。画像を読み込むたびに 0 へ戻る
+    rotation: u8,
     image_paths: Vec<PathBuf>,
     // 前回の利用可能なウィンドウサイズ（"fit" モードで使用）
     last_available_size: Option<Vec2>,
@@ -389,10 +647,19 @@ struct ImageViewer {
     // 読み込むと、GL バックエンドが最大テクスチャサイズを報告する前なので、大きな画像で
     // 「maximum texture side is 2048」パニックが起きる）。
     pending_open: Option<PathBuf>,
+    // 直近に設定したウィンドウタイトル（毎フレームの Title コマンド送信を避ける）
+    last_title: String,
+    // 自動更新の状態（バックグラウンドスレッドと共有）
+    update_status: updater::SharedStatus,
+    // 起動時の自分自身のパス。exe 差し替え後の再起動に使う
+    // （self-replace 後の current_exe() はリネーム後のパスを返し得るため起動時に確保する）
+    exe_path: Option<PathBuf>,
+    // 更新適用後の再起動確認ダイアログを一度だけ出すためのフラグ
+    restart_prompted: bool,
 }
 
 impl ImageViewer {
-    fn new(_cc: &eframe::CreationContext<'_>, initial_image: Option<PathBuf>, config: ViewerConfig) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, initial_image: Option<PathBuf>, config: ViewerConfig) -> Self {
         let mut viewer = Self {
             config,
             current_image: None,
@@ -400,11 +667,16 @@ impl ImageViewer {
             image_size: None,
             scale: 1.0,
             pan_offset: Vec2::ZERO,
+            rotation: 0,
             image_paths: Vec::new(),
             last_available_size: None,
             mouse_gesture: MouseGesture::new(),
             fontdb: None,
             pending_open: None,
+            last_title: String::new(),
+            update_status: updater::new_shared_status(),
+            exe_path: std::env::current_exe().ok(),
+            restart_prompted: false,
         };
 
         // 初期画像は new() 内ではなく最初の update() フレームで読み込む（理由は pending_open の定義参照）。
@@ -416,22 +688,98 @@ impl ImageViewer {
             }
         }
 
+        // 起動時の更新確認（バックグラウンド。失敗しても Help メニューに出るだけでアプリは動く）
+        if viewer.config.check_updates {
+            updater::spawn_check(viewer.update_status.clone(), cc.egui_ctx.clone());
+        }
+
         viewer
     }
 
-    /// 画像サイズに合わせ、利用可能領域全体に収まる scale を計算する
-    fn fit_to_screen(&mut self, ctx: &egui::Context) {
-        if let Some(size) = self.image_size {
-            let available_size = ctx.available_rect().size();
-            let image_aspect = size[0] as f32 / size[1] as f32;
-            let screen_aspect = available_size.x / available_size.y;
-            self.scale = if image_aspect > screen_aspect {
-                available_size.x / size[0] as f32
-            } else {
-                available_size.y / size[1] as f32
-            };
+    /// 更新の確認ダイアログを出し、承諾されたらダウンロードと差し替えを開始する
+    fn start_update(&mut self, version: String, url: String, ctx: &egui::Context) {
+        let Some(exe) = self.exe_path.clone() else {
+            rfd::MessageDialog::new()
+                .set_title("アップデート")
+                .set_description("実行ファイルのパスを取得できないため更新できません")
+                .show();
+            return;
+        };
+        let answer = rfd::MessageDialog::new()
+            .set_title("アップデート")
+            .set_description(&format!(
+                "新しいバージョン {version} をダウンロードして適用しますか？\n（適用後、再起動すると新しいバージョンになります）"
+            ))
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show();
+        if answer == rfd::MessageDialogResult::Yes {
+            updater::spawn_download_and_install(
+                self.update_status.clone(),
+                version,
+                url,
+                exe,
+                ctx.clone(),
+            );
+        }
+    }
+
+    /// 新しい exe で自分自身を起動し直し、このプロセスを終了する
+    fn restart_to_apply_update(&mut self, ctx: &egui::Context) {
+        let Some(exe) = self.exe_path.clone() else { return };
+        let mut cmd = std::process::Command::new(&exe);
+        // いま表示している画像を引き継ぐ
+        if let Some(p) = &self.current_path {
+            cmd.arg(p);
+        }
+        match cmd.spawn() {
+            Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(e) => {
+                let message = format!("再起動に失敗しました: {e}\n手動でアプリを起動し直してください。");
+                error!("{}", message);
+                rfd::MessageDialog::new()
+                    .set_title("アップデート")
+                    .set_description(&message)
+                    .show();
+            }
+        }
+    }
+
+    /// 回転を考慮した、拡大率 1.0 のときの表示サイズ（論理ポイント）
+    fn display_base_size(&self) -> Vec2 {
+        let (w, h) = match &self.current_image {
+            Some(LoadedImage::Raster { texture, .. }) => {
+                let s = texture.size_vec2();
+                (s.x, s.y)
+            }
+            Some(LoadedImage::Svg { size, .. }) => (size[0], size[1]),
+            None => (0.0, 0.0),
+        };
+        let (w, h) = rotated_dims(w, h, self.rotation);
+        Vec2::new(w, h)
+    }
+
+    /// 画像（回転考慮）が利用可能領域全体に収まる scale を計算する
+    fn fit_to_screen(&mut self, avail: Vec2) {
+        let base = self.display_base_size();
+        if base.x > 0.0 && base.y > 0.0 && avail.x > 0.0 && avail.y > 0.0 {
+            self.scale = (avail.x / base.x).min(avail.y / base.y);
             info!("画面に合わせてスケールを設定: {}", self.scale);
         }
+    }
+
+    /// anchor（スクリーン座標）の位置にある画像上の点を固定したままズームする
+    fn zoom_at(&mut self, anchor: Vec2, panel_rect: &Rect, base_size: Vec2, new_scale: f32) {
+        let old_scale = self.scale;
+        if old_scale <= 0.0 || (new_scale - old_scale).abs() < f32::EPSILON {
+            return;
+        }
+        let old_size = base_size * old_scale;
+        let new_size = base_size * new_scale;
+        let old_origin = panel_rect.min.to_vec2() + (panel_rect.size() - old_size) * 0.5 + self.pan_offset;
+        let new_origin = anchor - (anchor - old_origin) * (new_scale / old_scale);
+        self.scale = new_scale;
+        self.pan_offset =
+            new_origin - panel_rect.min.to_vec2() - (panel_rect.size() - new_size) * 0.5;
     }
 
     /// 指定パスの画像を読み込み、拡大率、パン位置、画像サイズを更新する
@@ -439,23 +787,18 @@ impl ImageViewer {
         info!("画像を読み込もうとしています: {:?}", path);
         self.pan_offset = Vec2::ZERO;
         self.scale = 1.0;
+        self.rotation = 0;
         self.image_size = None;
 
-        let result = if let Some(ext) = path.extension() {
-            let ext = ext.to_string_lossy().to_lowercase();
-            if ext == "svg" {
-                self.load_svg(path, ctx)
-            } else {
-                self.load_raster(path, ctx)
-            }
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let result = if ext == "svg" || ext == "svgz" {
+            self.load_svg(path)
         } else {
-            let message = format!("サポートされていないファイル形式です: {}", path.display());
-            error!("{}", message);
-            rfd::MessageDialog::new()
-                .set_title("エラー")
-                .set_description(&message)
-                .show();
-            false
+            // 拡張子が不明でも WIC フォールバック込みでラスタとして試す
+            self.load_raster(path, ctx)
         };
 
         if result {
@@ -471,62 +814,10 @@ impl ImageViewer {
         result
     }
 
-    fn load_svg(&mut self, path: &Path, ctx: &egui::Context) -> bool {
-        if let Ok(svg_data) = fs::read_to_string(path) {
-            info!("SVGファイルを読み込みました: {} bytes", svg_data.len());
-            // SVG 内のテキストはパース時にフォントDBを使ってパス化される。
-            // フォントDBが空だと文字が一切描画されないため、システムフォントをロードしておく。
-            // 構築コストが高いので初回のみ作成し、以降は Arc を共有して再利用する。
-            let fontdb = self
-                .fontdb
-                .get_or_insert_with(|| {
-                    let mut db = usvg::fontdb::Database::new();
-                    db.load_system_fonts();
-                    info!("システムフォントをロードしました: {} faces", db.len());
-                    Arc::new(db)
-                })
-                .clone();
-            let mut opt = Options::default();
-            opt.fontdb = fontdb;
-            if let Ok(tree) = Tree::from_str(&svg_data, &opt) {
-                let size = tree.size();
-                let width = size.width() as u32;
-                let height = size.height() as u32;
-                info!("SVGサイズ: {}x{}", width, height);
-                self.image_size = Some([width, height]);
-
-                // 初期レンダリング（scale=1.0）
-                if let Some(mut pixmap) = Pixmap::new(width, height) {
-                    resvg::render(&tree, usvg::Transform::default(), &mut pixmap.as_mut());
-                    let image = egui::ColorImage::from_rgba_unmultiplied(
-                        [width as usize, height as usize],
-                        pixmap.data(),
-                    );
-                    let texture = ctx.load_texture(
-                        path.to_string_lossy().to_string(),
-                        image,
-                        Default::default(),
-                    );
-                    self.current_image = Some(LoadedImage::Svg {
-                        tree,
-                        original_size: [width, height],
-                        texture,
-                        last_scale: 1.0,
-                        path: path.to_path_buf(),
-                    });
-                    info!("SVGの読み込みが完了しました");
-                    true
-                } else {
-                    let message = format!("SVGの描画に失敗しました: メモリが不足している可能性があります");
-                    error!("{}", message);
-                    rfd::MessageDialog::new()
-                        .set_title("エラー")
-                        .set_description(&message)
-                        .show();
-                    false
-                }
-            } else {
-                let message = format!("SVGの解析に失敗しました: {}", path.display());
+    fn load_svg(&mut self, path: &Path) -> bool {
+        match self.try_load_svg(path) {
+            Ok(()) => true,
+            Err(message) => {
                 error!("{}", message);
                 rfd::MessageDialog::new()
                     .set_title("エラー")
@@ -534,15 +825,62 @@ impl ImageViewer {
                     .show();
                 false
             }
-        } else {
-            let message = format!("SVGファイルの読み込みに失敗しました: {}", path.display());
-            error!("{}", message);
-            rfd::MessageDialog::new()
-                .set_title("エラー")
-                .set_description(&message)
-                .show();
-            false
         }
+    }
+
+    fn try_load_svg(&mut self, path: &Path) -> Result<(), String> {
+        let raw = fs::read(path)
+            .map_err(|e| format!("SVGファイルの読み込みに失敗しました: {} - {}", path.display(), e))?;
+        // .svgz（gzip 圧縮 SVG）対応
+        let raw = decompress_if_gzip(raw)?;
+        let svg_text = String::from_utf8_lossy(&raw);
+        info!("SVGファイルを読み込みました: {} bytes", svg_text.len());
+
+        // SVG 内のテキストはパース時にフォントDBを使ってパス化される。
+        // フォントDBが空だと文字が一切描画されないため、システムフォントをロードしておく。
+        // 構築コストが高いので初回のみ作成し、以降は Arc を共有して再利用する。
+        let fontdb = self
+            .fontdb
+            .get_or_insert_with(|| {
+                let mut db = usvg::fontdb::Database::new();
+                db.load_system_fonts();
+                info!("システムフォントをロードしました: {} faces", db.len());
+                Arc::new(db)
+            })
+            .clone();
+
+        // @font-face による埋め込み・参照フォントがあれば、システムフォントDBの
+        // コピーへ追加登録して使う（usvg 自身は @font-face を解釈しない）。
+        let fontdb = if svg_text.contains("@font-face") {
+            let mut db = (*fontdb).clone();
+            let n = load_embedded_fonts(&svg_text, &mut db, path.parent());
+            info!("@font-face から {} 個のフォントを読み込みました", n);
+            Arc::new(db)
+        } else {
+            fontdb
+        };
+
+        let mut opt = Options::default();
+        opt.fontdb = fontdb;
+        // SVG から相対参照される画像などの解決基準ディレクトリ
+        opt.resources_dir = path.parent().map(|p| p.to_path_buf());
+
+        let tree = Tree::from_str(&svg_text, &opt)
+            .map_err(|e| format!("SVGの解析に失敗しました: {} - {}", path.display(), e))?;
+        let size = tree.size();
+        let (w, h) = (size.width(), size.height());
+        info!("SVGサイズ: {}x{}", w, h);
+        self.image_size = Some([w.ceil() as u32, h.ceil() as u32]);
+        // テクスチャは生成しない。描画時に可視領域だけを表示解像度でラスタライズする。
+        self.current_image = Some(LoadedImage::Svg {
+            tree,
+            size: [w, h],
+            texture: None,
+            view: None,
+            path: path.to_path_buf(),
+        });
+        info!("SVGの読み込みが完了しました");
+        Ok(())
     }
 
     fn load_raster(&mut self, path: &Path, ctx: &egui::Context) -> bool {
@@ -587,10 +925,20 @@ impl ImageViewer {
                 let size = [width, height];
                 let pixels = image.into_vec();
                 let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                // 拡大時の補間は設定で切り替え（滑らか／ピクセル等倍）。縮小は常にバイリニア。
+                let magnification = if self.config.smooth_zoom {
+                    egui::TextureFilter::Linear
+                } else {
+                    egui::TextureFilter::Nearest
+                };
                 let texture = ctx.load_texture(
                     path.to_string_lossy().to_string(),
                     color_image,
-                    Default::default(),
+                    egui::TextureOptions {
+                        magnification,
+                        minification: egui::TextureFilter::Linear,
+                        ..Default::default()
+                    },
                 );
                 self.current_image = Some(LoadedImage::Raster {
                     texture,
@@ -638,7 +986,12 @@ impl ImageViewer {
                             }
                         })
                         .collect();
-                    files.sort();
+                    // エクスプローラーと同じ感覚で並ぶよう自然順（img2 < img10）でソート
+                    files.sort_by(|a, b| {
+                        let an = a.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        let bn = b.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        natural_cmp(&an, &bn).then_with(|| a.cmp(b))
+                    });
                     self.image_paths = files;
                     info!("ディレクトリの読み込みに成功しました: {:?}", parent);
                 }
@@ -667,7 +1020,7 @@ impl ImageViewer {
                 if current_index > 0 {
                     current_index - 1
                 } else {
-                    self.image_paths.len() - 1
+                    self.image_paths.len().saturating_sub(1)
                 }
             };
             if let Some(path) = self.image_paths.get(new_index).cloned() {
@@ -676,12 +1029,34 @@ impl ImageViewer {
         }
     }
 
-    /// アプリケーション更新処理  
-    /// ・ドラッグ＆ドロップによるファイル読み込み  
-    /// ・メニューバー（File / Options）の表示  
-    /// ・"fit" モードの場合、ウィンドウサイズ変更時に scale 再計算  
-    /// ・SVG は、拡大率に応じた表示解像度でラスタライズし直し、拡大してもボケないようにする
-    /// ・Fキーを押すと位置リセット＆フィットウィンドウ表示、0キーを押すと100%（scale=1.0）表示
+    /// フォルダ内の指定インデックスの画像へ切り替え（Home/End 用）
+    fn load_image_at(&mut self, ctx: &egui::Context, index: usize) {
+        if let Some(path) = self.image_paths.get(index).cloned() {
+            if Some(&path) != self.current_path.as_ref() {
+                self.load_image(&path, ctx);
+            }
+        }
+    }
+
+    /// ファイルダイアログで画像を開く
+    fn open_file_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(file_path) = rfd::FileDialog::new()
+            .add_filter("Images", SUPPORTED_EXTS)
+            .add_filter("All Files", &["*"])
+            .pick_file()
+        {
+            self.load_image(&file_path, ctx);
+            self.update_image_list(&file_path);
+        }
+    }
+
+    /// アプリケーション更新処理
+    /// ・ドラッグ＆ドロップによるファイル読み込み
+    /// ・メニューバー（File / Options）の表示
+    /// ・"fit" モードの場合、ウィンドウサイズ変更時に scale 再計算
+    /// ・SVG は毎フレーム可視領域だけを表示解像度でラスタライズし、どの倍率でも線が鮮明なまま
+    /// ・キー操作: ←→/PgUp/PgDn/Space/BS=前後, Home/End=先頭末尾, F=フィット, 0=100%,
+    ///   +/-=ズーム, L/R=回転, F11=全画面, O=開く, Esc=終了
     fn update(&mut self, ctx: &egui::Context) {
         // 初期画像の遅延読み込み（最初のフレームで一度だけ）。
         // ここなら GL バックエンドが報告した正しい max_texture_side が使えるため、
@@ -691,28 +1066,19 @@ impl ImageViewer {
             self.update_image_list(&path);
         }
 
-        // ドラッグ＆ドロップ対応
-        let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
-        for dropped in dropped_files {
-            if let Some(path) = dropped.path {
-                self.load_image(&path, ctx);
-                self.update_image_list(&path);
-            }
+        // ドラッグ＆ドロップ対応（複数ドロップ時は先頭のみ開く。同フォルダの残りは前後送りで辿れる）
+        let dropped = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()));
+        if let Some(path) = dropped {
+            self.load_image(&path, ctx);
+            self.update_image_list(&path);
         }
 
         // メニューバー（File / Options）の表示
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("Open").clicked() {
-                        if let Some(file_path) = rfd::FileDialog::new()
-                            .add_filter("Images", SUPPORTED_EXTS)
-                            .add_filter("All Files", &["*"])
-                            .pick_file()
-                        {
-                            self.load_image(&file_path, ctx);
-                            self.update_image_list(&file_path);
-                        }
+                    if ui.button("Open... (O)").clicked() {
+                        self.open_file_dialog(ctx);
                         ui.close_menu();
                     }
                 });
@@ -735,9 +1101,45 @@ impl ImageViewer {
                     ui.add_space(8.0);
 
                     ui.group(|ui| {
+                        ui.label("Zoom");
+                        ui.separator();
+                        if ui
+                            .checkbox(&mut self.config.smooth_zoom, "Smooth magnification")
+                            .changed()
+                        {
+                            // ラスタ画像のテクスチャフィルタは生成時に決まるため、読み直して反映する
+                            if let Some(LoadedImage::Raster { path, .. }) = &self.current_image {
+                                let path = path.clone();
+                                let keep = (
+                                    self.scale,
+                                    self.pan_offset,
+                                    self.last_available_size,
+                                    self.rotation,
+                                );
+                                if self.load_image(&path, ctx) {
+                                    (
+                                        self.scale,
+                                        self.pan_offset,
+                                        self.last_available_size,
+                                        self.rotation,
+                                    ) = keep;
+                                }
+                            }
+                        }
+                        ui.add(
+                            egui::Slider::new(&mut self.config.wheel_zoom_factor, 0.0002..=0.005)
+                                .logarithmic(true)
+                                .text("Wheel zoom speed"),
+                        );
+                    });
+
+                    ui.add_space(8.0);
+
+                    ui.group(|ui| {
                         ui.label("Other Settings");
                         ui.separator();
                         ui.checkbox(&mut self.config.enable_debug_log, "Enable Debug Log");
+                        ui.checkbox(&mut self.config.check_updates, "Check updates on startup");
                     });
 
                     ui.add_space(8.0);
@@ -750,202 +1152,408 @@ impl ImageViewer {
                         ui.close_menu();
                     }
                 });
+                ui.menu_button("Help", |ui| {
+                    ui.label(format!("MSBT-yuina v{}", updater::CURRENT_VERSION));
+                    ui.separator();
+                    let status = self.update_status.lock().unwrap().clone();
+                    match status {
+                        UpdateStatus::Checking => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("更新を確認中…");
+                            });
+                        }
+                        UpdateStatus::Downloading { version } => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(format!("{version} をダウンロード中…"));
+                            });
+                        }
+                        UpdateStatus::Available { version, url } => {
+                            if ui.button(format!("Update to {version}")).clicked() {
+                                ui.close_menu();
+                                self.start_update(version, url, ctx);
+                            }
+                        }
+                        UpdateStatus::Ready { version } => {
+                            if ui.button(format!("再起動して {version} を適用")).clicked() {
+                                self.restart_to_apply_update(ctx);
+                            }
+                        }
+                        UpdateStatus::UpToDate => {
+                            ui.label("最新バージョンです");
+                            if ui.button("Check for Updates").clicked() {
+                                updater::spawn_check(self.update_status.clone(), ctx.clone());
+                            }
+                        }
+                        UpdateStatus::Failed(e) => {
+                            ui.label(
+                                egui::RichText::new("更新の確認/適用に失敗")
+                                    .color(ui.visuals().warn_fg_color),
+                            )
+                            .on_hover_text(e);
+                            if ui.button("Check for Updates").clicked() {
+                                updater::spawn_check(self.update_status.clone(), ctx.clone());
+                            }
+                        }
+                        UpdateStatus::Idle => {
+                            if ui.button("Check for Updates").clicked() {
+                                updater::spawn_check(self.update_status.clone(), ctx.clone());
+                            }
+                        }
+                    }
+                    ui.separator();
+                    ui.hyperlink_to(
+                        "GitHub Releases",
+                        format!(
+                            "https://github.com/{}/{}/releases",
+                            updater::REPO_OWNER,
+                            updater::REPO_NAME
+                        ),
+                    );
+                });
+
+                // 右端: 更新が利用可能／適用済みのときだけ目立つボタンを出す
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let status = self.update_status.lock().unwrap().clone();
+                    match status {
+                        UpdateStatus::Available { version, url } => {
+                            let text = egui::RichText::new(format!("⬆ Update {version}"))
+                                .color(Color32::from_rgb(255, 210, 90));
+                            if ui.button(text).clicked() {
+                                self.start_update(version, url, ctx);
+                            }
+                        }
+                        UpdateStatus::Downloading { .. } => {
+                            ui.spinner();
+                        }
+                        UpdateStatus::Ready { .. } => {
+                            let text = egui::RichText::new("↻ 再起動して更新を適用")
+                                .color(Color32::from_rgb(140, 220, 140));
+                            if ui.button(text).clicked() {
+                                self.restart_to_apply_update(ctx);
+                            }
+                        }
+                        _ => {}
+                    }
+                });
             });
         });
 
-        // 画像が未読込の場合、current_path があれば読み込み
-        if self.current_image.is_none() {
-            if let Some(path) = self.current_path.clone() {
-                self.load_image(&path, ctx);
+        // 更新の適用（exe差し替え）が完了したら、一度だけ再起動を促す
+        let ready_version = match &*self.update_status.lock().unwrap() {
+            UpdateStatus::Ready { version } => Some(version.clone()),
+            _ => None,
+        };
+        if let Some(version) = ready_version {
+            if !self.restart_prompted {
+                self.restart_prompted = true;
+                let answer = rfd::MessageDialog::new()
+                    .set_title("アップデート")
+                    .set_description(&format!(
+                        "バージョン {version} を適用しました。今すぐ再起動しますか？"
+                    ))
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show();
+                if answer == rfd::MessageDialogResult::Yes {
+                    self.restart_to_apply_update(ctx);
+                }
             }
         }
 
         ctx.set_visuals(egui::Visuals::dark());
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let available_rect = ui.available_rect_before_wrap();
-            if self.config.initial_display_mode == "fit" {
-                if self.last_available_size.map_or(true, |last| last != available_rect.size()) {
-                    self.fit_to_screen(ctx);
-                    self.last_available_size = Some(available_rect.size());
+        egui::CentralPanel::default()
+            // 既定フレームの内側余白をなくし、画像領域をパネル全体に広げる
+            .frame(egui::Frame::default())
+            .show(ctx, |ui| {
+                let panel_rect = ui.available_rect_before_wrap();
+
+                // fit モード: ウィンドウサイズが変わったら再フィット
+                if self.config.initial_display_mode == "fit"
+                    && self.last_available_size.map_or(true, |last| last != panel_rect.size())
+                {
+                    self.fit_to_screen(panel_rect.size());
+                    self.last_available_size = Some(panel_rect.size());
                 }
-            }
 
-            // SVG はベクターなので、ラスタ画像のように1枚のテクスチャを引き伸ばすと
-            // 拡大時にボケる。表示する実ピクセル数（拡大率 × HiDPI の pixels_per_point）に
-            // 合わせて毎回ラスタライズし直し、常に 1:1 の鮮明な描画を保つ。
-            if let Some(LoadedImage::Svg {
-                tree,
-                original_size,
-                ref mut texture,
-                ref mut last_scale,
-                ..
-            }) = &mut self.current_image
-            {
-                let ppp = ctx.pixels_per_point();
-                // GPU テクスチャ上限を超えるとパニックするため、実機の max_texture_side で各辺をクランプ
-                // （メモリ暴走の保険も兼ねる）。
-                let max_dim = ctx.input(|i| i.max_texture_side).max(1) as f32;
-                let target_w =
-                    (original_size[0] as f32 * self.scale * ppp).round().clamp(1.0, max_dim) as u32;
-                let target_h =
-                    (original_size[1] as f32 * self.scale * ppp).round().clamp(1.0, max_dim) as u32;
-                let cur = texture.size();
-                // テクスチャ解像度が表示解像度とずれ、かつ前回描画から 2% 以上スケールが
-                // 変化したときだけ再生成する（連続ズーム中の過剰な再レンダリングを抑えつつ、
-                // 体感でボケない細かさを確保する）。
-                let size_mismatch = cur[0] as u32 != target_w || cur[1] as u32 != target_h;
-                let scale_changed = (self.scale - *last_scale).abs() > (*last_scale).max(0.01) * 0.02;
-                if size_mismatch && scale_changed {
-                    if let Some(mut pixmap) = Pixmap::new(target_w, target_h) {
-                        let sx = target_w as f32 / original_size[0] as f32;
-                        let sy = target_h as f32 / original_size[1] as f32;
-                        resvg::render(tree, usvg::Transform::from_scale(sx, sy), &mut pixmap.as_mut());
-                        let image = egui::ColorImage::from_rgba_unmultiplied(
-                            [target_w as usize, target_h as usize],
-                            pixmap.data(),
-                        );
-                        *texture = ctx.load_texture("svg_texture", image, Default::default());
-                        *last_scale = self.scale;
-                        info!(
-                            "SVG再レンダリング: {}x{} (scale: {:.3}, ppp: {})",
-                            target_w, target_h, self.scale, ppp
-                        );
-                    }
-                }
-            }
-
-            self.draw_checker_background(ui);
-
-            if let Some(image) = &self.current_image {
-                let rect_size = available_rect.size();
-                // 表示サイズ（論理ポイント）。
-                // ラスタは「元ピクセル数 × 拡大率」。
-                // SVG はテクスチャを表示解像度ぴったりに焼き直しているので、
-                // 「元SVGサイズ × 拡大率」をそのまま表示サイズにすると 1:1 で鮮明に出る
-                // （以前は texture_size × scale としていたため scale が二重に掛かっていた）。
-                let scaled_size = match image {
-                    LoadedImage::Raster { texture, .. } => texture.size_vec2() * self.scale,
-                    LoadedImage::Svg { original_size, .. } => {
-                        egui::vec2(original_size[0] as f32, original_size[1] as f32) * self.scale
-                    }
-                };
-                let pos = available_rect.min + (rect_size - scaled_size) * 0.5 + self.pan_offset;
-                let rect = Rect::from_min_size(pos, scaled_size);
-                ui.put(
-                    rect,
-                    egui::Image::new(match image {
-                        LoadedImage::Raster { texture, .. } => texture,
-                        LoadedImage::Svg { texture, .. } => texture,
-                    })
-                    .fit_to_exact_size(scaled_size),
-                );
-
-                // キー入力処理
-                if ui.input(|i| i.key_pressed(Key::ArrowRight)) {
-                    self.load_adjacent_image(ctx, true);
-                } else if ui.input(|i| i.key_pressed(Key::ArrowLeft)) {
-                    self.load_adjacent_image(ctx, false);
-                } else if ui.input(|i| i.key_pressed(Key::F)) {
-                    // Fキー：位置リセット＆フィットウィンドウ表示
-                    self.pan_offset = Vec2::ZERO;
-                    self.fit_to_screen(ctx);
-                } else if ui.input(|i| i.key_pressed(Key::Num0)) {
-                    // 0キー：位置リセット＆100%表示（scale = 1.0）
-                    self.pan_offset = Vec2::ZERO;
-                    self.scale = 1.0;
-                } else if ui.input(|i| i.key_pressed(Key::O)) {
-                    if let Some(file_path) = rfd::FileDialog::new()
-                        .add_filter("Images", SUPPORTED_EXTS)
-                        .add_filter("All Files", &["*"])
-                        .pick_file()
-                    {
-                        self.load_image(&file_path, ctx);
-                        self.update_image_list(&file_path);
-                    }
-                } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+                // 画像の有無に関わらず有効なキー
+                if ui.input(|i| i.key_pressed(Key::Escape)) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-
-                let old_scale = self.scale;
-
-                if ui.input(|i| i.key_pressed(Key::Plus)) {
-                    self.scale = (self.scale * 1.1).clamp(0.1, 10.0);
-
-                    // 画面中央を基準に拡大
-                    let image_center = available_rect.center().to_vec2();
-                    let image_pos = available_rect.min.to_vec2() + (available_rect.size() - scaled_size) * 0.5 + self.pan_offset;
-                    let offset_from_center = image_pos - image_center;
-                    self.pan_offset = image_center + offset_from_center * (self.scale / old_scale) - available_rect.min.to_vec2() - (available_rect.size() - scaled_size * (self.scale / old_scale)) * 0.5;
-                } else if ui.input(|i| i.key_pressed(Key::Minus)) {
-                    self.scale = (self.scale / 1.1).clamp(0.1, 10.0);
-
-                    // 画面中央を基準に縮小
-                    let image_center = available_rect.center().to_vec2();
-                    let image_pos = available_rect.min.to_vec2() + (available_rect.size() - scaled_size) * 0.5 + self.pan_offset;
-                    let offset_from_center = image_pos - image_center;
-                    self.pan_offset = image_center + offset_from_center * (self.scale / old_scale) - available_rect.min.to_vec2() - (available_rect.size() - scaled_size * (self.scale / old_scale)) * 0.5;
+                if ui.input(|i| i.key_pressed(Key::F11)) {
+                    let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+                }
+                if ui.input(|i| i.key_pressed(Key::O)) {
+                    self.open_file_dialog(ctx);
                 }
 
                 let response = ui.interact(
-                    available_rect,
+                    panel_rect,
                     ui.id().with("drag_area"),
                     egui::Sense::click_and_drag(),
                 );
 
-                if response.dragged() && !ui.input(|i| i.pointer.secondary_down()) {
-                    self.pan_offset += response.drag_delta();
-                }
+                if self.current_image.is_some() {
+                    // ---- フォルダ内ナビゲーション ----
+                    if ui.input(|i| {
+                        i.key_pressed(Key::ArrowRight)
+                            || i.key_pressed(Key::PageDown)
+                            || i.key_pressed(Key::Space)
+                    }) {
+                        self.load_adjacent_image(ctx, true);
+                    } else if ui.input(|i| {
+                        i.key_pressed(Key::ArrowLeft)
+                            || i.key_pressed(Key::PageUp)
+                            || i.key_pressed(Key::Backspace)
+                    }) {
+                        self.load_adjacent_image(ctx, false);
+                    } else if ui.input(|i| i.key_pressed(Key::Home)) {
+                        self.load_image_at(ctx, 0);
+                    } else if ui.input(|i| i.key_pressed(Key::End)) {
+                        self.load_image_at(ctx, self.image_paths.len().saturating_sub(1));
+                    }
 
-                let wheel_delta = ui.input(|i| i.raw_scroll_delta.y);
-                if wheel_delta != 0.0 {
-                    let zoom_factor = 1.0 + wheel_delta * self.config.wheel_zoom_factor;
-                    let new_scale = (self.scale * zoom_factor).clamp(0.1, 10.0);
-                    self.scale = new_scale;
+                    // マウスジェスチャー（右ドラッグ）で前後送り
+                    let mouse_pos = ui.input(|i| i.pointer.hover_pos()).unwrap_or(Pos2::ZERO);
+                    let right_button = ui.input(|i| i.pointer.secondary_down());
+                    if let Some(action) = self.mouse_gesture.update(mouse_pos.to_vec2(), right_button) {
+                        match action.as_str() {
+                            "<<<" => self.load_adjacent_image(ctx, false),
+                            ">>>" => self.load_adjacent_image(ctx, true),
+                            _ => {}
+                        }
+                    }
 
-                    // マウスカーソル位置を基準に拡大縮小
-                    if let Some(cursor_pos) = response.hover_pos() {
-                        let cursor_pos = cursor_pos.to_vec2();
-                        let image_pos = available_rect.min.to_vec2() + (available_rect.size() - scaled_size) * 0.5 + self.pan_offset;
-                        
-                        // カーソルから画像の相対位置を計算
-                        let rel_pos = (cursor_pos - image_pos) / old_scale;
-                        
-                        // 新しい画像位置を計算
-                        let new_image_pos = cursor_pos - rel_pos * self.scale;
-                        self.pan_offset = new_image_pos - available_rect.min.to_vec2() - (available_rect.size() - scaled_size * (self.scale / old_scale)) * 0.5;
+                    // ---- 回転（R=右90°, L=左90°）----
+                    let rot_before = self.rotation;
+                    if ui.input(|i| i.key_pressed(Key::R)) {
+                        self.rotation = (self.rotation + 1) % 4;
+                    }
+                    if ui.input(|i| i.key_pressed(Key::L)) {
+                        self.rotation = (self.rotation + 3) % 4;
+                    }
+                    if self.rotation != rot_before {
+                        self.pan_offset = Vec2::ZERO;
+                        if self.config.initial_display_mode == "fit" {
+                            self.fit_to_screen(panel_rect.size());
+                        }
+                    }
+
+                    // ---- 表示リセット ----
+                    if ui.input(|i| i.key_pressed(Key::F)) {
+                        // Fキー：位置リセット＆フィットウィンドウ表示
+                        self.pan_offset = Vec2::ZERO;
+                        self.fit_to_screen(panel_rect.size());
+                    }
+                    if ui.input(|i| i.key_pressed(Key::Num0)) {
+                        // 0キー：位置リセット＆100%表示（scale = 1.0）
+                        self.pan_offset = Vec2::ZERO;
+                        self.scale = 1.0;
+                    }
+
+                    // ナビゲーション等でこのフレーム中に画像が読み込み直された場合、
+                    // ここでフィットさせて「1フレームだけ等倍表示される」ちらつきを防ぐ
+                    if self.config.initial_display_mode == "fit" && self.last_available_size.is_none() {
+                        self.fit_to_screen(panel_rect.size());
+                        self.last_available_size = Some(panel_rect.size());
+                    }
+
+                    // ---- ズーム（回転を考慮した表示サイズを基準に、アンカー位置固定で計算）----
+                    let base_size = self.display_base_size();
+                    if ui.input(|i| i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals)) {
+                        let new_scale = (self.scale * KEY_ZOOM_STEP).clamp(MIN_SCALE, MAX_SCALE);
+                        self.zoom_at(panel_rect.center().to_vec2(), &panel_rect, base_size, new_scale);
+                    }
+                    if ui.input(|i| i.key_pressed(Key::Minus)) {
+                        let new_scale = (self.scale / KEY_ZOOM_STEP).clamp(MIN_SCALE, MAX_SCALE);
+                        self.zoom_at(panel_rect.center().to_vec2(), &panel_rect, base_size, new_scale);
+                    }
+
+                    let wheel_delta = ui.input(|i| i.raw_scroll_delta.y);
+                    if wheel_delta != 0.0 {
+                        let factor = 1.0 + wheel_delta * self.config.wheel_zoom_factor;
+                        let new_scale = (self.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
+                        // マウスカーソル位置を基準に拡大縮小
+                        let anchor = response
+                            .hover_pos()
+                            .map(|p| p.to_vec2())
+                            .unwrap_or_else(|| panel_rect.center().to_vec2());
+                        self.zoom_at(anchor, &panel_rect, base_size, new_scale);
+                    }
+
+                    // ダブルクリックで フィット⇔100% をトグル
+                    if response.double_clicked() {
+                        self.pan_offset = Vec2::ZERO;
+                        if (self.scale - 1.0).abs() < 0.01 {
+                            self.fit_to_screen(panel_rect.size());
+                        } else {
+                            self.scale = 1.0;
+                        }
+                    }
+
+                    // 左ドラッグでパン（右ドラッグはジェスチャー）
+                    if response.dragged() && !ui.input(|i| i.pointer.secondary_down()) {
+                        self.pan_offset += response.drag_delta();
                     }
                 }
 
-                // マウスジェスチャーの更新と判定
-                let mouse_pos = ui.input(|i| i.pointer.hover_pos()).unwrap_or(Pos2::ZERO);
-                let right_button = ui.input(|i| i.pointer.secondary_down());
-                
-                // updateの戻り値でアクションを受け取る
-                if let Some(action) = self.mouse_gesture.update(mouse_pos.to_vec2(), right_button) {
-                    match action.as_str() {
-                        "<<<" => self.load_adjacent_image(ctx, false),
-                        ">>>" => self.load_adjacent_image(ctx, true),
-                        _ => {}
+                // ---- 描画 ----
+                self.draw_checker_background(ui);
+
+                let scale = self.scale;
+                let rotation = self.rotation;
+                let pan = self.pan_offset;
+                let base_size = self.display_base_size();
+                let ppp = ctx.pixels_per_point();
+                let max_dim = ctx.input(|i| i.max_texture_side).max(1) as f32;
+
+                if let Some(image) = &mut self.current_image {
+                    let scaled_size = base_size * scale;
+                    let origin = panel_rect.min + (panel_rect.size() - scaled_size) * 0.5 + pan;
+                    let image_rect = Rect::from_min_size(origin, scaled_size);
+
+                    match image {
+                        LoadedImage::Raster { texture, .. } => {
+                            draw_texture_rotated(ui.painter(), texture, image_rect, rotation);
+                        }
+                        LoadedImage::Svg { tree, size, texture, view, .. } => {
+                            // SVG はベクターなので、1枚のテクスチャを引き伸ばすと拡大時にボケる。
+                            // 可視領域（＋余白）だけを表示解像度ちょうどでラスタライズし直すことで、
+                            // どんな拡大率でも常に 1px=1texel の鮮明さを保つ。テクスチャはおおむね
+                            // 画面サイズ程度で済むため、高倍率でも巨大テクスチャを作らない。
+                            let scale_px = scale * ppp;
+                            let visible = image_rect.intersect(panel_rect);
+                            if visible.is_positive() && scale_px > 0.0 {
+                                let (full_w, full_h) = rotated_dims(size[0], size[1], rotation);
+                                let full_w_px = full_w * scale_px;
+                                let full_h_px = full_h * scale_px;
+                                // 可視部分（画像原点基準の物理px）
+                                let nx0 = ((visible.min.x - image_rect.min.x) * ppp)
+                                    .floor()
+                                    .clamp(0.0, full_w_px);
+                                let ny0 = ((visible.min.y - image_rect.min.y) * ppp)
+                                    .floor()
+                                    .clamp(0.0, full_h_px);
+                                let nx1 = ((visible.max.x - image_rect.min.x) * ppp)
+                                    .ceil()
+                                    .clamp(0.0, full_w_px);
+                                let ny1 = ((visible.max.y - image_rect.min.y) * ppp)
+                                    .ceil()
+                                    .clamp(0.0, full_h_px);
+
+                                // このフレームで描くべき crop（入力から決定的に計算される）
+                                let (tx, tw) =
+                                    crop_axis(nx0, nx1, full_w_px, SVG_RENDER_MARGIN_PX, max_dim);
+                                let (ty, th) =
+                                    crop_axis(ny0, ny1, full_h_px, SVG_RENDER_MARGIN_PX, max_dim);
+                                let target = [tx, ty, tw, th];
+
+                                // 直近の結果が必要領域を丸ごと含む（パン余白内）か、いま計算した
+                                // crop と一致するなら再利用。後者は可視領域が GPU 上限を超えて
+                                // 全体を含められない場合に、ビューが動かない限り再描画しないための条件。
+                                let cached = texture.is_some()
+                                    && view.as_ref().map_or(false, |v| {
+                                        v.rot == rotation
+                                            && (v.scale_px - scale_px).abs() <= scale_px * 1e-4
+                                            && (v.crop == target
+                                                || (v.crop[0] as f32 <= nx0
+                                                    && v.crop[1] as f32 <= ny0
+                                                    && (v.crop[0] + v.crop[2]) as f32 >= nx1
+                                                    && (v.crop[1] + v.crop[3]) as f32 >= ny1))
+                                    });
+
+                                if !cached {
+                                    let crop = target;
+                                    // 表示空間（回転後）の crop を SVG 空間の矩形へ写像
+                                    let svg_crop = map_display_crop_to_svg(
+                                        rotation,
+                                        size[0] * scale_px,
+                                        size[1] * scale_px,
+                                        [crop[0] as f32, crop[1] as f32, crop[2] as f32, crop[3] as f32],
+                                    );
+                                    let pw = svg_crop[2].round().max(1.0) as u32;
+                                    let ph = svg_crop[3].round().max(1.0) as u32;
+                                    if let Some(mut pixmap) = Pixmap::new(pw, ph) {
+                                        // SVG座標 → crop 内 px。回転は描画時の UV で表現するため含めない
+                                        let ts = usvg::Transform::from_scale(scale_px, scale_px)
+                                            .post_translate(-svg_crop[0], -svg_crop[1]);
+                                        resvg::render(tree, ts, &mut pixmap.as_mut());
+                                        // tiny-skia の出力は premultiplied RGBA なのでそのまま渡す
+                                        let img = egui::ColorImage::from_rgba_premultiplied(
+                                            [pw as usize, ph as usize],
+                                            pixmap.data(),
+                                        );
+                                        match texture.as_mut() {
+                                            Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                                            None => {
+                                                *texture = Some(ctx.load_texture(
+                                                    "svg_view",
+                                                    img,
+                                                    egui::TextureOptions::LINEAR,
+                                                ))
+                                            }
+                                        }
+                                        *view = Some(SvgView { scale_px, rot: rotation, crop });
+                                    }
+                                }
+
+                                if let (Some(t), Some(v)) = (texture.as_ref(), view.as_ref()) {
+                                    let tex_rect = Rect::from_min_size(
+                                        image_rect.min
+                                            + egui::vec2(v.crop[0] as f32, v.crop[1] as f32) / ppp,
+                                        egui::vec2(v.crop[2] as f32, v.crop[3] as f32) / ppp,
+                                    );
+                                    draw_texture_rotated(ui.painter(), t, tex_rect, v.rot);
+                                }
+                            }
+                        }
                     }
                 }
 
                 // マウスジェスチャーの描画
                 if self.mouse_gesture.is_active {
-                    self.mouse_gesture.draw(ui, available_rect.center());
+                    self.mouse_gesture.draw(ui, panel_rect.center());
                 }
-            }
-        });
+            });
 
-        // タイトルバーに、現在の拡大率とファイルパスを表示
-        if let Some(image) = &self.current_image {
-            let path_str = match image {
-                LoadedImage::Raster { path, .. } => path.to_string_lossy(),
-                LoadedImage::Svg { path, .. } => path.to_string_lossy(),
+        // タイトルバーに [位置/総数] サイズ 回転 拡大率 ファイルパスを表示（変化時のみ送信）
+        let title = if let Some(image) = &self.current_image {
+            let path = match image {
+                LoadedImage::Raster { path, .. } => path,
+                LoadedImage::Svg { path, .. } => path,
             };
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(
-                format!("MSBT-yuina - {}% - {}", (self.scale * 100.0) as i32, path_str)
-            ));
+            let pos_str = self
+                .current_path
+                .as_ref()
+                .and_then(|p| self.image_paths.iter().position(|x| x == p))
+                .map(|i| format!("[{}/{}] ", i + 1, self.image_paths.len()))
+                .unwrap_or_default();
+            let dims = self
+                .image_size
+                .map(|s| format!("{}x{} ", s[0], s[1]))
+                .unwrap_or_default();
+            let rot = match self.rotation {
+                1 => "90° ",
+                2 => "180° ",
+                3 => "270° ",
+                _ => "",
+            };
+            format!(
+                "MSBT-yuina - {}{}{}{}% - {}",
+                pos_str,
+                dims,
+                rot,
+                (self.scale * 100.0).round() as i32,
+                path.display()
+            )
+        } else {
+            "MSBT-yuina".to_string()
+        };
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
         }
     }
 
@@ -1112,5 +1720,194 @@ fn load_icon() -> IconData {
             error!("アイコンの読み込みに失敗: {}", e);
             create_fallback_icon()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn natural_cmp_orders_numeric_runs() {
+        assert_eq!(natural_cmp("img2.png", "img10.png"), Ordering::Less);
+        assert_eq!(natural_cmp("img10.png", "img2.png"), Ordering::Greater);
+        assert_eq!(natural_cmp("a.png", "b.png"), Ordering::Less);
+        assert_eq!(natural_cmp("IMG5.png", "img5.png"), Ordering::Equal.then(Ordering::Equal));
+        // 大文字小文字を無視して等価に扱われる（数値部の後まで一致）
+        assert_eq!(natural_cmp("IMG5.PNG", "img5.png"), Ordering::Equal);
+        assert_eq!(natural_cmp("img05.png", "img5.png"), Ordering::Greater); // 同値なら元の桁数で安定化
+        assert_eq!(natural_cmp("2.png", "10.png"), Ordering::Less);
+        assert_eq!(natural_cmp("", "a"), Ordering::Less);
+    }
+
+    #[test]
+    fn rotated_dims_swaps_on_odd_rotations() {
+        assert_eq!(rotated_dims(100.0, 50.0, 0), (100.0, 50.0));
+        assert_eq!(rotated_dims(100.0, 50.0, 1), (50.0, 100.0));
+        assert_eq!(rotated_dims(100.0, 50.0, 2), (100.0, 50.0));
+        assert_eq!(rotated_dims(100.0, 50.0, 3), (50.0, 100.0));
+    }
+
+    #[test]
+    fn crop_mapping_full_rect_is_identity() {
+        let (ws, hs) = (100.0, 50.0);
+        for rot in 0..4u8 {
+            let (dw, dh) = rotated_dims(ws, hs, rot);
+            let mapped = map_display_crop_to_svg(rot, ws, hs, [0.0, 0.0, dw, dh]);
+            assert_eq!(mapped, [0.0, 0.0, ws, hs], "rot={rot}");
+        }
+    }
+
+    #[test]
+    fn crop_mapping_corners() {
+        let (ws, hs) = (100.0, 50.0);
+        // rot=1（時計回り90°）: 表示の左上の小片は、SVG 空間では左下
+        assert_eq!(
+            map_display_crop_to_svg(1, ws, hs, [0.0, 0.0, 10.0, 20.0]),
+            [0.0, 40.0, 20.0, 10.0]
+        );
+        // rot=2（180°）: 表示の左上は SVG の右下
+        assert_eq!(
+            map_display_crop_to_svg(2, ws, hs, [0.0, 0.0, 10.0, 20.0]),
+            [90.0, 30.0, 10.0, 20.0]
+        );
+        // rot=3（270°）: 表示の左上は SVG の右上
+        assert_eq!(
+            map_display_crop_to_svg(3, ws, hs, [0.0, 0.0, 10.0, 20.0]),
+            [80.0, 0.0, 20.0, 10.0]
+        );
+    }
+
+    #[test]
+    fn crop_axis_covers_visible_and_respects_max() {
+        // 通常ケース: 可視区間＋余白、画像端でクランプ
+        assert_eq!(crop_axis(100.0, 500.0, 10000.0, 256.0, 8192.0), (0, 756));
+        assert_eq!(crop_axis(9900.0, 10000.0, 10000.0, 256.0, 8192.0), (9644, 356));
+        // 可視区間が GPU 上限を超える場合: 中央の max_dim 窓になり、入力が同じなら結果も同じ
+        let a = crop_axis(0.0, 3000.0, 5000.0, 256.0, 2048.0);
+        assert_eq!(a, crop_axis(0.0, 3000.0, 5000.0, 256.0, 2048.0));
+        assert_eq!(a.1, 2048);
+        let center = 1500u32;
+        assert!(a.0 <= center && center <= a.0 + a.1, "窓が可視中央を含まない: {a:?}");
+        // 余白を含めても max_dim を超えず、可視区間は丸ごと含む
+        let b = crop_axis(1000.0, 2900.0, 5000.0, 256.0, 2048.0);
+        assert!(b.1 <= 2048);
+        assert!(b.0 as f32 <= 1000.0 && (b.0 + b.1) as f32 >= 2900.0, "{b:?}");
+    }
+
+    #[test]
+    fn decompress_if_gzip_roundtrip() {
+        use std::io::Write as _;
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"#;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(svg).unwrap();
+        let gz = enc.finish().unwrap();
+        assert_eq!(decompress_if_gzip(gz).unwrap(), svg.to_vec());
+        // 非圧縮データはそのまま
+        assert_eq!(decompress_if_gzip(svg.to_vec()).unwrap(), svg.to_vec());
+    }
+
+    #[test]
+    fn font_magic_detection() {
+        assert!(is_supported_font(b"\x00\x01\x00\x00rest"));
+        assert!(is_supported_font(b"OTTOrest"));
+        assert!(!is_supported_font(b"wOFFrest"));
+        assert!(!is_supported_font(b"wOF2rest"));
+        assert!(!is_supported_font(b"<sv"));
+    }
+
+    fn render_svg(svg: &str, db: usvg::fontdb::Database, w: u32, h: u32) -> Pixmap {
+        let mut opt = Options::default();
+        opt.fontdb = Arc::new(db);
+        let tree = Tree::from_str(svg, &opt).expect("SVG parse failed");
+        let mut pixmap = Pixmap::new(w, h).unwrap();
+        resvg::render(&tree, usvg::Transform::default(), &mut pixmap.as_mut());
+        pixmap
+    }
+
+    /// y ∈ [y0, y1) の帯にある不透過ピクセル数
+    fn opaque_pixels_in_band(pixmap: &Pixmap, y0: u32, y1: u32) -> usize {
+        let w = pixmap.width();
+        pixmap
+            .pixels()
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| {
+                let y = (*i as u32) / w;
+                y >= y0 && y < y1 && p.alpha() > 0
+            })
+            .count()
+    }
+
+    #[test]
+    fn svg_text_renders_with_system_fonts() {
+        let mut db = usvg::fontdb::Database::new();
+        db.load_system_fonts();
+        assert!(db.len() > 0, "システムフォントが1つも見つからない");
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="100">
+            <text x="10" y="40" font-family="sans-serif" font-size="36" fill="black">Hello</text>
+            <text x="10" y="90" font-family="sans-serif" font-size="36" fill="black">こんにちは漢字</text>
+        </svg>"#;
+        let pixmap = render_svg(svg, db, 400, 100);
+        assert!(
+            opaque_pixels_in_band(&pixmap, 0, 50) > 50,
+            "ラテン文字のテキストが描画されていない"
+        );
+        assert!(
+            opaque_pixels_in_band(&pixmap, 50, 100) > 50,
+            "日本語テキストが描画されていない（フォントフォールバック不全）"
+        );
+    }
+
+    #[test]
+    fn embedded_font_face_is_loaded_and_rendered() {
+        use base64::Engine as _;
+        // システムフォントを一切ロードしない空のDBに、@font-face の data URI だけで
+        // フォントが供給されることを確認する（実フォントとして Windows の Arial を利用）
+        let font_path = Path::new("C:/Windows/Fonts/arial.ttf");
+        if !font_path.exists() {
+            eprintln!("skip: {} が見つからないためスキップ", font_path.display());
+            return;
+        }
+        let font_bytes = fs::read(font_path).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&font_bytes);
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="60">
+              <style>
+                @font-face {{
+                  font-family: 'Arial';
+                  src: url(data:font/ttf;base64,{b64});
+                }}
+              </style>
+              <text x="10" y="45" font-family="Arial" font-size="40" fill="black">Embedded</text>
+            </svg>"#
+        );
+
+        // ローダー無しでは 1 フォントも無く、テキストは描画されない
+        let empty_db = usvg::fontdb::Database::new();
+        let blank = render_svg(&svg, empty_db, 400, 60);
+        assert_eq!(opaque_pixels_in_band(&blank, 0, 60), 0, "空DBで描画されるのは想定外");
+
+        // ローダーを通すと描画される
+        let mut db = usvg::fontdb::Database::new();
+        let n = load_embedded_fonts(&svg, &mut db, None);
+        assert_eq!(n, 1, "@font-face のフォントを読み込めていない");
+        let pixmap = render_svg(&svg, db, 400, 60);
+        assert!(
+            opaque_pixels_in_band(&pixmap, 0, 60) > 100,
+            "埋め込みフォントのテキストが描画されていない"
+        );
+    }
+
+    #[test]
+    fn embedded_font_ignores_woff_and_http() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg">
+          <style>
+            @font-face { font-family: A; src: url(https://example.com/font.ttf); }
+            @font-face { font-family: B; src: url(data:font/woff2;base64,d09GMgABAAAA); }
+          </style>
+        </svg>"#;
+        let mut db = usvg::fontdb::Database::new();
+        assert_eq!(load_embedded_fonts(svg, &mut db, None), 0);
     }
 }

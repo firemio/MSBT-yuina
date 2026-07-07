@@ -6,3 +6,9 @@ enable_debug_log = false
 
 # マウスホイールの拡大率（1回の回転あたりの倍率）
 wheel_zoom_factor = 0.005
+
+# 拡大表示の補間: true=滑らか(バイリニア), false=ピクセル等倍(ニアレスト)
+smooth_zoom = true
+
+# 起動時に新バージョンを確認するかどうか
+check_updates = true
